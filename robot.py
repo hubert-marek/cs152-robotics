@@ -6,12 +6,15 @@ This module handles:
 - Movement primitives (move N cells, turn 90°)
 - Sensor reading (LiDAR, odometry, gyroscope)
 
-KB updates are handled by the mission controller, not here.
+High-level KB updates (task/plan state) are handled by the mission controller.
+This module may update KB occupancy (via LiDAR integration) and keep the KB pose
+in sync with the robot's pose estimate during scans.
 Environment setup is in simulation.py.
 """
 
 import math
 import time
+from collections import Counter
 
 import pybullet
 
@@ -225,6 +228,10 @@ class RobotController:
 
         # Discovered wall positions (landmarks for recalibration)
         self._wall_landmarks = {}
+        # Map PyBullet wall body id -> semantic wall type ("east"/"west"/"north"/"south").
+        # This prevents the recalibration math from ever "matching" a north-wall hit to
+        # an east/west wall line (a common failure mode seen in logs).
+        self._wall_id_to_type: dict[int, str] = {}
 
         self.lidar = Lidar(robot_id)
         self._ccw_command_increases_yaw = None
@@ -358,13 +365,45 @@ class RobotController:
             "yaw_deg": math.degrees(euler[2]),
         }
 
-    def scan_lidar(self, visualize=True):
-        """Scan and update KB occupancy."""
+    def scan_lidar(self, visualize=True, recalibrate=False):
+        """
+        Scan environment with LiDAR and update KB occupancy.
+
+        Args:
+            visualize: Draw LiDAR rays in simulation
+            recalibrate: If True, also run landmark-based pose recalibration
+
+        Returns:
+            scan_data: List of (angle, distance, obj_id) tuples
+        """
         scan_data = self.lidar.scan(visualize=visualize)
 
         # Debug: show scan stats
         hits = sum(1 for _, _, oid in scan_data if oid != -1)
         print(f"  [DEBUG] LiDAR scan: {len(scan_data)} rays, {hits} hits")
+
+        # Optionally recalibrate pose using wall landmarks BEFORE updating the KB.
+        # IMPORTANT: if recalibration changes our best pose estimate, we also
+        # sync the KB robot pose so planning/mapping share the same frame.
+        if recalibrate and self._wall_landmarks:
+            self._recalibrate_from_lidar(scan_data)
+
+        # Use the (possibly recalibrated) internal pose estimate to locate rays.
+        # This prevents occupancy updates from being "painted" relative to a stale
+        # discrete KB pose when the estimator drifts.
+        grid_x = int(round((self.pose_x - CELL_SIZE / 2) / CELL_SIZE))
+        grid_y = int(round((self.pose_y - CELL_SIZE / 2) / CELL_SIZE))
+
+        # Keep KB discrete pose aligned to the robot estimate (position), but
+        # preserve the KB heading (planner's discrete orientation).
+        try:
+            if getattr(self.kb, "in_bounds", None) is None or self.kb.in_bounds(
+                grid_x, grid_y
+            ):
+                self.kb.set_robot(grid_x, grid_y, self.kb.robot_heading)
+        except Exception:
+            # Never let scan/mapping crash due to a transient bad pose estimate.
+            pass
 
         integrate_lidar(
             self.kb,
@@ -372,6 +411,7 @@ class RobotController:
             cell_size=CELL_SIZE,
             max_range=self.lidar.max_range,
             is_obstacle=(lambda oid: oid in self.wall_ids) if self.wall_ids else None,
+            actual_robot_internal=(grid_x, grid_y, self.pose_yaw),
         )
 
         return scan_data
@@ -500,7 +540,10 @@ class RobotController:
         self.pose_x += linear_vel[0] * dt
         self.pose_y += linear_vel[1] * dt
 
-        # NOTE: LiDAR recalibration disabled - was causing more harm than good
+        # 3) LiDAR-based recalibration using known room boundaries
+        # Only runs if scan_data is provided (typically after waypoint navigation)
+        if scan_data:
+            self._recalibrate_from_lidar(scan_data)
 
     def _get_wall_distances(self, scan_data: list) -> dict:
         """
@@ -542,75 +585,423 @@ class RobotController:
 
         return result
 
+    def _classify_wall(self, abs_angle: float) -> str | None:
+        """
+        Classify which wall a ray is hitting based on its absolute angle.
+
+        In a rectangular room with axis-aligned walls:
+        - East wall (positive X): rays pointing roughly East (angle ≈ 0)
+        - North wall (positive Y): rays pointing roughly North (angle ≈ π/2)
+        - West wall (negative X): rays pointing roughly West (angle ≈ π or -π)
+        - South wall (negative Y): rays pointing roughly South (angle ≈ -π/2)
+
+        Returns wall name or None if angle is too diagonal.
+        """
+        # Normalize to [-π, π]
+        angle = normalize_angle(abs_angle)
+        angle_deg = math.degrees(angle)
+
+        # Allow 45° cone for each wall direction
+        if -45 < angle_deg < 45:
+            return "east"
+        elif 45 < angle_deg < 135:
+            return "north"
+        elif angle_deg > 135 or angle_deg < -135:
+            return "west"
+        elif -135 < angle_deg < -45:
+            return "south"
+        return None
+
     def _recalibrate_from_lidar(self, scan_data: list):
         """
-        Correct position estimate using discovered wall landmarks.
+        Correct continuous pose estimate (position AND heading) using wall landmarks.
 
-        First time seeing a wall: record its position as a landmark.
-        Later: compare current measurement to expected, correct drift.
+        Uses proper trigonometry to work at ANY heading.
+
+        Algorithm for POSITION:
+        1. For each ray hitting a known wall, calculate EXPECTED distance
+        2. Compare to MEASURED distance
+        3. Convert distance error to XY error and correct pose
+
+        Algorithm for HEADING:
+        We estimate yaw by minimizing the geometric residual between LiDAR hit
+        points and the known wall lines. For a candidate yaw θ, a wall-hit ray
+        (α, d) implies a hit point:
+            hx(θ) = pose_x + d*cos(θ+α)
+            hy(θ) = pose_y + d*sin(θ+α)
+        For an axis-aligned wall at x=const or y=const, the residual is the
+        signed distance to that wall line (in meters). We search θ in a small
+        window around the current estimate and pick the θ that minimizes a
+        trimmed mean of squared residuals (robust to outliers / mislabels).
         """
-        walls = self._get_wall_distances(scan_data)
-        if not walls:
+        # Safety: without an explicit wall-id allowlist, we cannot safely
+        # distinguish walls from dynamic objects (e.g., the box). In that case,
+        # NEVER attempt "wall-based" recalibration.
+        if not scan_data or not self._wall_landmarks or not self.wall_ids:
             return
 
-        # Check each cardinal direction we can see
-        for direction, distance in walls.items():
-            # Calculate wall angle in internal frame
-            if direction == "front":
-                wall_angle = self.pose_yaw
-            elif direction == "back":
-                wall_angle = self.pose_yaw + math.pi
-            elif direction == "left":
-                wall_angle = self.pose_yaw + math.pi / 2
-            elif direction == "right":
-                wall_angle = self.pose_yaw - math.pi / 2
-            else:
+        # DEBUG: Record pose before recalibration
+        pose_before_x, pose_before_y = self.pose_x, self.pose_y
+
+        # Position corrections are axis-constrained:
+        # - east/west walls constrain X
+        # - north/south walls constrain Y
+        x_errors: list[float] = []
+        y_errors: list[float] = []
+        wall_ray_samples: list[
+            tuple[str, float, float]
+        ] = []  # (wall, d_measured, d_expected)
+
+        for ray_angle, d_measured, obj_id in scan_data:
+            # Only process wall hits (never box / robot / goal)
+            if obj_id not in self.wall_ids:
+                continue
+            if obj_id == -1:  # No hit
+                continue
+            if d_measured <= 0.05 or d_measured > self.lidar.max_range + 1e-6:
                 continue
 
-            # Wall position in internal frame
-            wall_x = self.pose_x + distance * math.cos(wall_angle)
-            wall_y = self.pose_y + distance * math.sin(wall_angle)
+            a = normalize_angle(self.pose_yaw + ray_angle)
+            ca = math.cos(a)
+            sa = math.sin(a)
 
-            # Determine which axis this wall constrains
-            wall_angle_norm = normalize_angle(wall_angle)
-            wall_angle_deg = math.degrees(wall_angle_norm)
+            # Prefer a stable association: wall body id -> semantic wall type.
+            wall_type = self._wall_id_to_type.get(int(obj_id))
 
-            # Wall roughly perpendicular to X axis (East or West facing)
-            if abs(wall_angle_deg) < 30 or abs(wall_angle_deg) > 150:
-                axis = "x"
-                wall_coord = wall_x
-            # Wall roughly perpendicular to Y axis (North or South facing)
-            elif 60 < abs(wall_angle_deg) < 120:
-                axis = "y"
-                wall_coord = wall_y
+            # If we haven't associated this wall id yet, do a conservative one-shot
+            # association only when the ray is close to a cardinal direction.
+            if wall_type is None:
+                inferred = self._classify_wall(a)
+                if inferred is None:
+                    continue
+                expected_dirs = {
+                    "east": 0.0,
+                    "north": math.pi / 2,
+                    "west": math.pi,
+                    "south": -math.pi / 2,
+                }
+                if abs(normalize_angle(a - expected_dirs[inferred])) > math.radians(20):
+                    continue
+                # Avoid mapping multiple body IDs to the same semantic wall.
+                if inferred in self._wall_id_to_type.values():
+                    continue
+                wall_type = inferred
+                self._wall_id_to_type[int(obj_id)] = wall_type
+
+            key = f"wall_{wall_type}"
+            if key not in self._wall_landmarks:
+                # If we don't yet have this landmark, seed it from the current estimate.
+                # This is safe-ish because we only do it under the conservative
+                # near-cardinal gating above.
+                if wall_type in ("east", "west"):
+                    if abs(ca) < 0.2:
+                        continue
+                    self._wall_landmarks[key] = self.pose_x + d_measured * ca
+                else:
+                    if abs(sa) < 0.2:
+                        continue
+                    self._wall_landmarks[key] = self.pose_y + d_measured * sa
+
+            wall_pos = float(self._wall_landmarks[key])
+
+            # Residual in wall-coordinate space (equivalent to distance_error * cos/sin)
+            if wall_type in ("east", "west"):
+                if abs(ca) < 0.2:
+                    continue
+                residual = (self.pose_x + d_measured * ca) - wall_pos
+                if abs(residual) > CELL_SIZE * 1.0:
+                    continue
+                x_errors.append(residual)
+                d_expected = (wall_pos - self.pose_x) / ca
             else:
-                continue  # Diagonal, skip
+                if abs(sa) < 0.2:
+                    continue
+                residual = (self.pose_y + d_measured * sa) - wall_pos
+                if abs(residual) > CELL_SIZE * 1.0:
+                    continue
+                y_errors.append(residual)
+                d_expected = (wall_pos - self.pose_y) / sa
 
-            landmark_key = f"{direction}_{axis}"
+            wall_ray_samples.append((wall_type, d_measured, float(d_expected)))
 
-            if landmark_key not in self._wall_landmarks:
-                # First time seeing this wall - record as landmark
-                self._wall_landmarks[landmark_key] = wall_coord
-                print(
-                    f"    [LANDMARK] Recorded {landmark_key} at {axis}={wall_coord:.3f}"
+        # Apply position corrections
+        corrections_made = []
+        yaw_corrected = False
+
+        if x_errors:
+            # Use median to be robust against outliers
+            x_errors_sorted = sorted(x_errors)
+            avg_x_error = x_errors_sorted[len(x_errors_sorted) // 2]
+            if abs(avg_x_error) > 0.01:  # Only correct significant errors
+                old_x = self.pose_x
+                self.pose_x -= avg_x_error * 0.8  # 80% correction
+                corrections_made.append(
+                    f"X: {old_x:.3f}→{self.pose_x:.3f} (err={avg_x_error:+.3f}m, n={len(x_errors)})"
                 )
-            else:
-                # Seen before - check for drift and correct
-                expected = self._wall_landmarks[landmark_key]
-                error = wall_coord - expected
 
-                # Only correct if error is reasonable (not a different wall)
-                if abs(error) < CELL_SIZE * 2:  # Within 2 cells
-                    old_val = self.pose_x if axis == "x" else self.pose_y
-                    if axis == "x":
-                        self.pose_x -= error * 0.5  # Partial correction
-                    else:
-                        self.pose_y -= error * 0.5
-                    new_val = self.pose_x if axis == "x" else self.pose_y
-                    if abs(error) > 0.01:  # Only log significant corrections
-                        print(
-                            f"    [RECALIB] {landmark_key}: error={error:.3f}, {axis}: {old_val:.3f} → {new_val:.3f}"
-                        )
+        if y_errors:
+            y_errors_sorted = sorted(y_errors)
+            avg_y_error = y_errors_sorted[len(y_errors_sorted) // 2]
+            if abs(avg_y_error) > 0.01:
+                old_y = self.pose_y
+                self.pose_y -= avg_y_error * 0.8
+                corrections_made.append(
+                    f"Y: {old_y:.3f}→{self.pose_y:.3f} (err={avg_y_error:+.3f}m, n={len(y_errors)})"
+                )
+
+        # Apply heading correction
+        def _yaw_cost(theta: float) -> float | None:
+            residual2: list[float] = []
+            axis_counts = {"x": 0, "y": 0}
+            for ray_angle, d_measured, obj_id in scan_data:
+                if obj_id not in self.wall_ids:
+                    continue
+                if obj_id == -1:
+                    continue
+                if d_measured <= 0.05 or d_measured > self.lidar.max_range + 1e-6:
+                    continue
+
+                wall_type = self._wall_id_to_type.get(int(obj_id))
+                if wall_type is None:
+                    continue
+                key = f"wall_{wall_type}"
+                if key not in self._wall_landmarks:
+                    continue
+                wall_pos = float(self._wall_landmarks[key])
+
+                a = normalize_angle(theta + ray_angle)
+                ca = math.cos(a)
+                sa = math.sin(a)
+                if wall_type in ("east", "west"):
+                    if abs(ca) < 0.2:
+                        continue
+                    r = (self.pose_x + d_measured * ca) - wall_pos
+                    axis_counts["x"] += 1
+                else:
+                    if abs(sa) < 0.2:
+                        continue
+                    r = (self.pose_y + d_measured * sa) - wall_pos
+                    axis_counts["y"] += 1
+
+                if abs(r) > CELL_SIZE * 1.0:
+                    continue
+                residual2.append(r * r)
+
+            # Yaw is underconstrained unless we see BOTH an X-wall and a Y-wall.
+            if len(residual2) < 12 or axis_counts["x"] < 3 or axis_counts["y"] < 3:
+                return None
+            residual2.sort()
+            keep = max(5, int(len(residual2) * 0.7))  # trim worst 30%
+            return sum(residual2[:keep]) / keep
+
+        current_cost = _yaw_cost(self.pose_yaw)
+        best_theta = self.pose_yaw
+        best_cost = current_cost if current_cost is not None else float("inf")
+
+        # Search a window around current yaw.
+        # With the axis constraint above, yaw only updates near corners (seeing 2 walls),
+        # so we keep the search window tighter to avoid catastrophic flips.
+        window = math.radians(25.0)
+        step = math.radians(0.5)
+        theta = self.pose_yaw - window
+        end = self.pose_yaw + window
+        while theta <= end:
+            c = _yaw_cost(theta)
+            if c is not None and c < best_cost:
+                best_cost = c
+                best_theta = theta
+            theta += step
+
+        if current_cost is not None:
+            # Require meaningful improvement to avoid noisy oscillations
+            if best_cost < current_cost * 0.85:
+                yaw_err = normalize_angle(self.pose_yaw - best_theta)
+                # Hard bound: never apply huge yaw corrections in one shot.
+                if math.radians(2.0) < abs(yaw_err) < math.radians(15.0):
+                    old_yaw = self.pose_yaw
+                    self.pose_yaw = normalize_angle(self.pose_yaw - yaw_err * 0.7)
+                    yaw_corrected = True
+                    corrections_made.append(
+                        f"YAW: {math.degrees(old_yaw):.1f}°→{math.degrees(self.pose_yaw):.1f}° "
+                        f"(err={math.degrees(yaw_err):+.1f}°, n={len(scan_data)})"
+                    )
+
+        # If yaw changed, do one more lightweight XY correction with the new yaw.
+        if yaw_corrected:
+            x2: list[float] = []
+            y2: list[float] = []
+            for ray_angle, d_measured, obj_id in scan_data:
+                if obj_id not in self.wall_ids:
+                    continue
+                if obj_id == -1:
+                    continue
+                if d_measured <= 0.05 or d_measured > self.lidar.max_range + 1e-6:
+                    continue
+
+                wall_type = self._wall_id_to_type.get(int(obj_id))
+                if wall_type is None:
+                    continue
+                key = f"wall_{wall_type}"
+                if key not in self._wall_landmarks:
+                    continue
+                wall_pos = float(self._wall_landmarks[key])
+
+                abs_angle = normalize_angle(self.pose_yaw + ray_angle)
+                ca = math.cos(abs_angle)
+                sa = math.sin(abs_angle)
+
+                if wall_type in ("east", "west"):
+                    if abs(ca) < 0.2:
+                        continue
+                    residual = (self.pose_x + d_measured * ca) - wall_pos
+                    if abs(residual) > CELL_SIZE * 1.0:
+                        continue
+                    x2.append(residual)
+                else:
+                    if abs(sa) < 0.2:
+                        continue
+                    residual = (self.pose_y + d_measured * sa) - wall_pos
+                    if abs(residual) > CELL_SIZE * 1.0:
+                        continue
+                    y2.append(residual)
+
+            if x2:
+                x2s = sorted(x2)
+                dx = x2s[len(x2s) // 2]
+                if abs(dx) > 0.005:
+                    self.pose_x -= dx * 0.5
+            if y2:
+                y2s = sorted(y2)
+                dy = y2s[len(y2s) // 2]
+                if abs(dy) > 0.005:
+                    self.pose_y -= dy * 0.5
+
+        if corrections_made:
+            print(f"    [RECALIB] {', '.join(corrections_made)}")
+
+            # DEBUG: Show details of wall rays used for recalibration
+            total_correction = math.sqrt(
+                (self.pose_x - pose_before_x) ** 2 + (self.pose_y - pose_before_y) ** 2
+            )
+            if total_correction > 0.15:  # Log if correction is large (> 15cm)
+                print(
+                    f"      [DEBUG] Large correction! Total={total_correction:.3f}m from {len(wall_ray_samples)} wall rays:"
+                )
+                for i, (wall_name, d_m, d_e) in enumerate(wall_ray_samples[:5]):
+                    print(
+                        f"        Ray {i + 1}: {wall_name} wall, measured={d_m:.3f}m, expected={d_e:.3f}m, error={(d_m - d_e):+.3f}m"
+                    )
+                if len(wall_ray_samples) > 5:
+                    print(f"        ... and {len(wall_ray_samples) - 5} more rays")
+                print(
+                    f"      [DEBUG] Landmarks: {dict((k, f'{v:.3f}m') for k, v in self._wall_landmarks.items())}"
+                )
+
+    def record_wall_landmarks(self, scan_data: list = None) -> int:
+        """
+        Record wall positions as landmarks from current (trusted) position.
+
+        Uses proper trigonometry to calculate wall positions from LiDAR rays.
+        Call this when robot is at a verified position (e.g., at initialization
+        where we KNOW we're at (0,0)). The current pose is assumed accurate.
+
+        For each wall (east/west/north/south), we record its axis-aligned position:
+        - East/West walls: X coordinate where the wall exists
+        - North/South walls: Y coordinate where the wall exists
+
+        Returns:
+            Number of new landmarks recorded.
+        """
+        if scan_data is None:
+            scan_data = self.lidar.scan(visualize=False)
+
+        if not scan_data:
+            return 0
+
+        # Collect wall position samples for each wall type
+        wall_samples = {"east": [], "west": [], "north": [], "south": []}
+        # Also remember which wall body IDs contributed to each type.
+        wall_id_votes: dict[str, Counter[int]] = {
+            "east": Counter(),
+            "west": Counter(),
+            "north": Counter(),
+            "south": Counter(),
+        }
+
+        for ray_angle, distance, obj_id in scan_data:
+            # Only process wall hits
+            if self.wall_ids and obj_id not in self.wall_ids:
+                continue
+            if obj_id == -1:  # No hit
+                continue
+
+            # Calculate absolute angle of this ray
+            abs_angle = normalize_angle(self.pose_yaw + ray_angle)
+
+            # Classify which wall this ray is hitting
+            wall_type = self._classify_wall(abs_angle)
+            if wall_type is None:
+                continue
+            # Be strict when recording landmarks: only accept rays close to the
+            # wall's outward normal direction. This prevents diagonal rays that
+            # actually hit a different wall from being misclassified and "poisoning"
+            # the landmark set at initialization.
+            expected_dirs = {
+                "east": 0.0,
+                "north": math.pi / 2,
+                "west": math.pi,
+                "south": -math.pi / 2,
+            }
+            if abs(
+                normalize_angle(abs_angle - expected_dirs[wall_type])
+            ) > math.radians(25):
+                continue
+
+            # Calculate wall position using trigonometry
+            # Hit point: (pose_x + d*cos(abs_angle), pose_y + d*sin(abs_angle))
+            hit_x = self.pose_x + distance * math.cos(abs_angle)
+            hit_y = self.pose_y + distance * math.sin(abs_angle)
+
+            # For axis-aligned walls, record the relevant coordinate
+            if wall_type in ("east", "west"):
+                wall_samples[wall_type].append(hit_x)
+            else:  # north, south
+                wall_samples[wall_type].append(hit_y)
+            wall_id_votes[wall_type][int(obj_id)] += 1
+
+        # Record landmarks using median of samples (robust to noise)
+        recorded = 0
+        for wall_type, samples in wall_samples.items():
+            if len(samples) < 3:  # Need enough samples for reliability
+                continue
+
+            # Use median for robustness
+            samples_sorted = sorted(samples)
+            wall_pos = samples_sorted[len(samples_sorted) // 2]
+
+            landmark_key = f"wall_{wall_type}"
+            old_val = self._wall_landmarks.get(landmark_key)
+            self._wall_landmarks[landmark_key] = wall_pos
+            recorded += 1
+
+            # If we have enough votes, bind the dominant wall body id to this type.
+            # This makes later recalibration use the wall id directly (no guessing).
+            if wall_id_votes[wall_type]:
+                wall_id, count = wall_id_votes[wall_type].most_common(1)[0]
+                if count >= 3:
+                    self._wall_id_to_type[wall_id] = wall_type
+
+            axis = "X" if wall_type in ("east", "west") else "Y"
+            if old_val is None:
+                print(
+                    f"    [LANDMARK] New: {wall_type} wall at {axis}={wall_pos:.3f}m (n={len(samples)})"
+                )
+            elif abs(old_val - wall_pos) > 0.05:
+                print(
+                    f"    [LANDMARK] Updated: {wall_type} wall {axis}: {old_val:.3f}→{wall_pos:.3f}m"
+                )
+
+        return recorded
 
     def get_pose(self) -> dict:
         """Get current pose estimate (internal frame, robot starts at 0,0)."""
@@ -652,6 +1043,15 @@ class RobotController:
             (self.pose_x - actual["x_internal"]) ** 2
             + (self.pose_y - actual["y_internal"]) ** 2
         )
+
+        # DEBUG: Show coordinate conversion details if correction is significant
+        if correction > 0.02:
+            print(
+                f"      [SNAP-DEBUG] Conversion: grid({grid_x},{grid_y}) → meters({self.pose_x:.3f},{self.pose_y:.3f})"
+            )
+            print(
+                f"      [SNAP-DEBUG] Internal pose: before=({old_x:.3f},{old_y:.3f}), after=({self.pose_x:.3f},{self.pose_y:.3f})"
+            )
 
         print(
             f"      [SNAP] Grid ({grid_x},{grid_y}) h={heading}: correction={correction:.3f}m, actual_error={actual_error:.3f}m "
@@ -793,10 +1193,36 @@ class RobotController:
         self._stop()
         self._wait_and_step(10, realtime=False)
 
+        # Post-motion pose correction using LiDAR landmarks (NO KB updates here).
+        # This is critical for turns-in-place, which can introduce translational slip;
+        # without this, the mission can falsely conclude it "missed" a waypoint and
+        # spiral into repeated replanning.
+
+        # Measure distance BEFORE recalibration
+        pre_recalib_dx = target_x - self.pose_x
+        pre_recalib_dy = target_y - self.pose_y
+        pre_recalib_dist = math.sqrt(
+            pre_recalib_dx * pre_recalib_dx + pre_recalib_dy * pre_recalib_dy
+        )
+
+        if self._wall_landmarks:
+            scan_data = self.lidar.scan(visualize=False)
+            self._recalibrate_from_lidar(scan_data)
+
         # DEBUG: Show arrival accuracy - compare internal vs actual
         final_dx = target_x - self.pose_x
         final_dy = target_y - self.pose_y
         final_dist = math.sqrt(final_dx * final_dx + final_dy * final_dy)
+
+        # DEBUG: Warn if recalibration made arrival WORSE
+        if abs(final_dist - pre_recalib_dist) > 0.05:
+            delta_sign = "worse" if final_dist > pre_recalib_dist else "better"
+            print(
+                f"      [DEBUG] Recalib changed distance-to-target: {pre_recalib_dist:.3f}m → {final_dist:.3f}m ({delta_sign})"
+            )
+
+        # Re-evaluate arrival after recalibration
+        reached = final_dist < CELL_SIZE * 0.08
 
         actual = self.get_actual_pose()
         actual_dx = target_x - actual["x_internal"]

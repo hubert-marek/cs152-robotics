@@ -97,9 +97,8 @@ class MissionController:
             # Update KB to match
             self._sync_kb_to_position(wx, wy, heading)
 
-            # Scan and recalibrate at waypoint
-            scan_data = self.robot.scan_lidar(visualize=realtime)
-            self.robot.update_pose(scan_data=scan_data)
+            # Scan and recalibrate pose using wall landmarks at waypoint
+            _ = self.robot.scan_lidar(visualize=realtime, recalibrate=True)
 
         return True
 
@@ -152,9 +151,9 @@ class MissionController:
         """
         Sync KB robot position to target waypoint position.
 
-        IMPORTANT: We trust the waypoint target over the drifting internal pose.
-        After navigation, we snap both KB and internal pose to the target to
-        prevent drift accumulation.
+        We set the KB to the intended waypoint (planner frame). After this, a LiDAR
+        scan with recalibration can refine the robot's internal pose estimate, and
+        the scan logic will keep KB pose aligned to that estimate.
         """
         # Get actual internal pose for debugging
         pose = self.robot.get_pose()
@@ -243,8 +242,8 @@ class MissionController:
             # Debug: show real vs KB state
             self._debug_print_state(step)
 
-            # Scan and check for box
-            scan_data = self.robot.scan_lidar(visualize=realtime)
+            # Scan with recalibration, then check for box
+            scan_data = self.robot.scan_lidar(visualize=realtime, recalibrate=True)
 
             if self._check_for_box(scan_data):
                 print(f"\n  >>> BOX FOUND at step {step}! <<<")
@@ -268,8 +267,8 @@ class MissionController:
                 print(
                     f"  [DEBUG] frontiers() returned {len(frontiers)} cells: {list(frontiers)[:10]}"
                 )
-                # LiDAR is 360° - single scan is sufficient
-                scan_data = self.robot.scan_lidar(visualize=realtime)
+                # LiDAR is 360° - single scan with recalibration is sufficient
+                scan_data = self.robot.scan_lidar(visualize=realtime, recalibrate=True)
                 if self._check_for_box(scan_data):
                     print("\n  >>> BOX FOUND during final scan! <<<")
                     return True
@@ -285,7 +284,13 @@ class MissionController:
         return False
 
     def _check_for_box(self, scan_data) -> bool:
-        """Check if the box is visible in the current scan."""
+        """
+        Check if the box is visible in the current scan.
+
+        Uses the robot's INTERNAL pose estimate (which should be recalibrated
+        before calling this) to calculate box position. This keeps everything
+        in the internal coordinate frame without relying on PyBullet ground truth.
+        """
         # Debug: show what object IDs we're seeing
         detected_ids = set(obj_id for _, _, obj_id in scan_data if obj_id != -1)
         print(
@@ -294,37 +299,59 @@ class MissionController:
 
         for angle, distance, obj_id in scan_data:
             if obj_id == self.box_id:
-                # LiDAR distance is measured from the robot's actual position; use debug-only
-                # actual pose, but compute everything in the INTERNAL frame for consistency.
-                actual_pose = self.robot.get_actual_pose()
-                robot_yaw = actual_pose["yaw"]
+                # Use INTERNAL pose (recalibrated) - not PyBullet ground truth
+                # This keeps the entire system in the internal coordinate frame
+                pose = self.robot.get_pose()
+                robot_x = pose["x"]
+                robot_y = pose["y"]
+                robot_yaw = pose["yaw"]
 
+                # Calculate box hit position using trig
                 # angle is relative to robot's heading
-                angle_world = robot_yaw + angle
+                abs_angle = robot_yaw + angle
+                hit_x = robot_x + distance * math.cos(abs_angle)
+                hit_y = robot_y + distance * math.sin(abs_angle)
 
-                # Hit point in INTERNAL meters
-                hit_x = actual_pose["x_internal"] + distance * math.cos(angle_world)
-                hit_y = actual_pose["y_internal"] + distance * math.sin(angle_world)
-
-                # Convert to INTERNAL grid
+                # Convert to internal grid
                 box_grid_x = int(round((hit_x - CELL_SIZE / 2) / CELL_SIZE))
                 box_grid_y = int(round((hit_y - CELL_SIZE / 2) / CELL_SIZE))
 
-                internal_pose = self.robot.get_pose()
                 print(f"  Box detected at internal grid ({box_grid_x}, {box_grid_y})")
                 print(
-                    f"    [DEBUG] Internal pose: ({internal_pose['grid_x']}, {internal_pose['grid_y']}) yaw={internal_pose['yaw_deg']:.1f}°"
-                )
-                print(
-                    f"    [DEBUG] Actual pose (internal): grid=({actual_pose['grid_x_internal']},{actual_pose['grid_y_internal']}) "
-                    f"[world_grid=({actual_pose['grid_x_world']},{actual_pose['grid_y_world']})]"
+                    f"    [DEBUG] Robot pose: ({pose['grid_x']}, {pose['grid_y']}) yaw={pose['yaw_deg']:.1f}°"
                 )
                 print(
                     f"    [DEBUG] LiDAR: angle={math.degrees(angle):.1f}°, dist={distance:.2f}m"
                 )
+                # DEBUG: Show conversion steps
+                print(
+                    f"    [CONVERT-DEBUG] Internal pose meters: ({pose['x']:.3f},{pose['y']:.3f})"
+                )
+                print(
+                    f"    [CONVERT-DEBUG] Ray: angle={math.degrees(angle):.1f}°, abs={math.degrees(abs_angle):.1f}°, dist={distance:.3f}m"
+                )
+                print(
+                    f"    [CONVERT-DEBUG] Hit: ({hit_x:.3f},{hit_y:.3f}) → grid=({box_grid_x},{box_grid_y})"
+                )
+
+                # Debug: compare with actual position (for verification only)
+                actual = self.robot.get_actual_pose()
+                if (pose["grid_x"], pose["grid_y"]) != (
+                    actual["grid_x_internal"],
+                    actual["grid_y_internal"],
+                ):
+                    print(
+                        f"    [DEBUG] ⚠️ Pose mismatch: internal=({pose['grid_x']},{pose['grid_y']}) "
+                        f"vs actual=({actual['grid_x_internal']},{actual['grid_y_internal']})"
+                    )
 
                 if self.kb.box_found:
+                    old_box = self.kb.box
                     self.kb.move_box(box_grid_x, box_grid_y)
+                    if old_box != (box_grid_x, box_grid_y):
+                        print(
+                            f"    [DEBUG] Box moved: {old_box} → ({box_grid_x}, {box_grid_y})"
+                        )
                 else:
                     self.kb.set_box(box_grid_x, box_grid_y)
                 return True
@@ -392,7 +419,7 @@ class MissionController:
             realtime: Whether to add visualization delays
             replan_depth: Current recursion depth (for loop prevention)
         """
-        MAX_REPLAN_DEPTH = 5
+        MAX_REPLAN_DEPTH = 10
 
         if actions is None:
             print("  ERROR: No plan provided!")
@@ -408,24 +435,42 @@ class MissionController:
             LiDAR-based box observation (no ground-truth).
             """
             print(f"      [REPLAN] Triggered: {reason}")
+            print("        [REPLAN-STATE] Before refresh:")
+            print(
+                f"          KB: robot=({self.kb.robot_x},{self.kb.robot_y}) h={self.kb.robot_heading}, box=({self.kb.box_x},{self.kb.box_y})"
+            )
+            internal_pre = self.robot.get_pose()
+            print(
+                f"          Internal: robot=({internal_pre['grid_x']},{internal_pre['grid_y']}) yaw={internal_pre['yaw_deg']:.1f}°"
+            )
 
             if replan_depth >= MAX_REPLAN_DEPTH:
                 print(f"      [ERROR] Max replan depth ({MAX_REPLAN_DEPTH}) reached!")
                 return False
 
-            # Refresh box estimate (best effort)
-            scan_data = self.robot.scan_lidar(visualize=False)
+            # Refresh box estimate with recalibration (best effort)
+            print("        [REPLAN] Scanning for box position...")
+            scan_data = self.robot.scan_lidar(visualize=False, recalibrate=True)
             box_found = self._update_box_from_lidar(scan_data)
 
             if not box_found:
+                print("        [REPLAN] Box not visible - backing up...")
                 # Back up and scan again (may be occluded by the robot/box contact)
                 self.robot.move("backward", realtime)
-                scan_data = self.robot.scan_lidar(visualize=False)
+                scan_data = self.robot.scan_lidar(visualize=False, recalibrate=True)
                 self._update_box_from_lidar(scan_data)
 
             # Sync robot pose from sensors
             pose = self.robot.get_pose()
             self.kb.set_robot(pose["grid_x"], pose["grid_y"], heading_for_kb)
+
+            print("        [REPLAN-STATE] After refresh:")
+            print(
+                f"          KB: robot=({self.kb.robot_x},{self.kb.robot_y}) h={self.kb.robot_heading}, box=({self.kb.box_x},{self.kb.box_y})"
+            )
+            print(
+                f"        [REPLAN] Planning from robot=({self.kb.robot_x},{self.kb.robot_y}) to deliver box ({self.kb.box_x},{self.kb.box_y})→({self.kb.goal_x},{self.kb.goal_y})..."
+            )
 
             new_plan = planning.plan_box_delivery(self.kb)
             if new_plan is None:
@@ -511,6 +556,9 @@ class MissionController:
 
             # Execute actions
             if action == "turn_left":
+                print(
+                    f"      [EXEC] Turning left: heading {current_heading} → {(current_heading - 1) % 4}"
+                )
                 # Safety: check if in contact with box before turning
                 if self.robot.is_in_contact_with(self.box_id):
                     print(
@@ -522,20 +570,31 @@ class MissionController:
                     self.kb.set_robot(
                         backup_pose["grid_x"], backup_pose["grid_y"], current_heading
                     )
+                    print(
+                        f"        [BACKUP] Pose after backup: ({backup_pose['grid_x']},{backup_pose['grid_y']})"
+                    )
 
                 new_heading = (current_heading - 1) % 4
+                print(
+                    f"        [NAV] Executing turn-in-place to heading {new_heading}..."
+                )
                 reached = self.robot.move_to_waypoint(
                     robot_x, robot_y, new_heading, realtime
                 )
                 if not reached:
+                    print("        [FAILED] Turn did not complete successfully")
                     return _replan_delivery(
                         reason=f"turn_left failed to reach ({robot_x},{robot_y})",
                         heading_for_kb=current_heading,
                     )
+                print("        [SUCCESS] Turn completed")
                 self.kb.set_robot(robot_x, robot_y, new_heading)
                 if SNAP_INTERNAL_POSE:
                     self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
             elif action == "turn_right":
+                print(
+                    f"      [EXEC] Turning right: heading {current_heading} → {(current_heading + 1) % 4}"
+                )
                 # Safety: check if in contact with box before turning
                 if self.robot.is_in_contact_with(self.box_id):
                     print(
@@ -547,16 +606,24 @@ class MissionController:
                     self.kb.set_robot(
                         backup_pose["grid_x"], backup_pose["grid_y"], current_heading
                     )
+                    print(
+                        f"        [BACKUP] Pose after backup: ({backup_pose['grid_x']},{backup_pose['grid_y']})"
+                    )
 
                 new_heading = (current_heading + 1) % 4
+                print(
+                    f"        [NAV] Executing turn-in-place to heading {new_heading}..."
+                )
                 reached = self.robot.move_to_waypoint(
                     robot_x, robot_y, new_heading, realtime
                 )
                 if not reached:
+                    print("        [FAILED] Turn did not complete successfully")
                     return _replan_delivery(
                         reason=f"turn_right failed to reach ({robot_x},{robot_y})",
                         heading_for_kb=current_heading,
                     )
+                print("        [SUCCESS] Turn completed")
                 self.kb.set_robot(robot_x, robot_y, new_heading)
                 if SNAP_INTERNAL_POSE:
                     self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
@@ -566,6 +633,9 @@ class MissionController:
                 target_y = robot_y + dy
 
                 if will_push:
+                    print(
+                        f"      [EXEC] Pushing box from ({self.kb.box_x},{self.kb.box_y}) to ({new_box_x},{new_box_y})"
+                    )
                     # Push with bump sensor feedback
                     pushed = self._push_box_with_verification(
                         target_x,
@@ -576,18 +646,34 @@ class MissionController:
                         realtime,
                     )
                     if pushed:
-                        # Verify push via LiDAR (no ground-truth): require that the box
-                        # is re-observed at the expected destination cell.
-                        scan_data = self.robot.scan_lidar(visualize=False)
+                        print(
+                            "        [PUSH-RESULT] Robot finished pushing (traveled ~1 cell)"
+                        )
+                        # Verify push via LiDAR with recalibration (no ground-truth):
+                        # require that the box is re-observed at the expected destination cell.
+                        print(
+                            f"        [VERIFY] Scanning to confirm box moved to ({new_box_x},{new_box_y})..."
+                        )
+                        scan_data = self.robot.scan_lidar(
+                            visualize=False, recalibrate=True
+                        )
                         box_found = self._update_box_from_lidar(scan_data)
 
                         if not box_found:
+                            print(
+                                "        [VERIFY] Box not visible - backing up and re-scanning..."
+                            )
                             # Back up and scan again (robot may occlude the box)
                             self.robot.move("backward", realtime)
-                            scan_data = self.robot.scan_lidar(visualize=False)
+                            scan_data = self.robot.scan_lidar(
+                                visualize=False, recalibrate=True
+                            )
                             box_found = self._update_box_from_lidar(scan_data)
 
                         if (self.kb.box_x, self.kb.box_y) != (new_box_x, new_box_y):
+                            print(
+                                f"        [VERIFY-FAILED] Box is at ({self.kb.box_x},{self.kb.box_y}), expected ({new_box_x},{new_box_y})"
+                            )
                             # Treat as failed push; do NOT advance KB box belief blindly.
                             return _replan_delivery(
                                 reason=(
@@ -597,7 +683,9 @@ class MissionController:
                                 heading_for_kb=current_heading,
                             )
 
-                        print(f"      [KB] Box confirmed at ({new_box_x}, {new_box_y})")
+                        print(
+                            f"      [KB] Box confirmed at ({new_box_x}, {new_box_y}) ✓"
+                        )
                     else:
                         # Push failed - try to replan
                         print("      [PUSH FAILED] Attempting to replan...")
@@ -636,16 +724,24 @@ class MissionController:
                         )
                 else:
                     # Regular movement (non-push)
+                    print(
+                        f"      [EXEC] Moving forward: ({robot_x},{robot_y}) → ({target_x},{target_y})"
+                    )
                     reached = self.robot.move_to_waypoint(
                         target_x, target_y, current_heading, realtime
                     )
                     if not reached:
+                        print("        [FAILED] Move did not complete successfully")
                         return _replan_delivery(
                             reason=f"move_forward failed to reach ({target_x},{target_y})",
                             heading_for_kb=current_heading,
                         )
+                    print("        [SUCCESS] Move completed")
 
                 # Update KB robot position to target (trust the plan)
+                print(
+                    f"        [KB-UPDATE] Robot: ({robot_x},{robot_y}) → ({target_x},{target_y})"
+                )
                 self.kb.set_robot(target_x, target_y, current_heading)
                 if SNAP_INTERNAL_POSE:
                     self.robot.snap_pose_to_grid(target_x, target_y, current_heading)
@@ -694,49 +790,65 @@ class MissionController:
         """
         Re-detect box position using LiDAR scan (realistic sensing).
 
-        Updates KB's box position if box is detected.
+        Uses the robot's INTERNAL pose estimate (which should be recalibrated
+        before calling this) to calculate box position.
 
         Returns:
             True if box was detected in scan
         """
-        # PyBullet offset - robot spawns at (1,1) but internal frame starts at (0,0)
-        pybullet_offset = (1, 1)
-
         for angle, distance, obj_id in scan_data:
             if obj_id == self.box_id:
-                # IMPORTANT: LiDAR distance is measured from ACTUAL robot position,
-                # so we must use actual pose for hit calculation, then convert to internal frame
-                actual_pose = self.robot.get_actual_pose()
-                world_angle = actual_pose["yaw"] + angle
-                hit_x = actual_pose["x"] + distance * math.cos(world_angle)
-                hit_y = actual_pose["y"] + distance * math.sin(world_angle)
+                # Use INTERNAL pose (recalibrated) - not PyBullet ground truth
+                pose = self.robot.get_pose()
+                robot_x = pose["x"]
+                robot_y = pose["y"]
+                robot_yaw = pose["yaw"]
 
-                # Convert hit point to PyBullet grid cell
-                box_pybullet_gx = int(round((hit_x - CELL_SIZE / 2) / CELL_SIZE))
-                box_pybullet_gy = int(round((hit_y - CELL_SIZE / 2) / CELL_SIZE))
+                # Calculate box hit position using trig
+                abs_angle = robot_yaw + angle
+                hit_x = robot_x + distance * math.cos(abs_angle)
+                hit_y = robot_y + distance * math.sin(abs_angle)
 
-                # Convert to internal frame (subtract offset)
-                box_grid_x = box_pybullet_gx - pybullet_offset[0]
-                box_grid_y = box_pybullet_gy - pybullet_offset[1]
+                # Convert to internal grid
+                box_grid_x_raw = int(round((hit_x - CELL_SIZE / 2) / CELL_SIZE))
+                box_grid_y_raw = int(round((hit_y - CELL_SIZE / 2) / CELL_SIZE))
+                box_grid_x = box_grid_x_raw
+                box_grid_y = box_grid_y_raw
 
                 # Heuristic: if the ray direction is diagonal but rounding produced a
                 # 4-neigh (cardinal) adjacent cell, "promote" it to the diagonal cell.
-                internal_pose = self.robot.get_pose()
-                rx, ry = internal_pose["grid_x"], internal_pose["grid_y"]
-                ux, uy = math.cos(world_angle), math.sin(world_angle)
+                rx, ry = pose["grid_x"], pose["grid_y"]
+                ux, uy = math.cos(abs_angle), math.sin(abs_angle)
                 diag = abs(ux) > 0.35 and abs(uy) > 0.35
                 manhattan = abs(box_grid_x - rx) + abs(box_grid_y - ry)
+                promoted = False
                 if diag and manhattan == 1:
                     if box_grid_x == rx:
                         box_grid_x += 1 if ux > 0 else -1
+                        promoted = True
                     if box_grid_y == ry:
                         box_grid_y += 1 if uy > 0 else -1
+                        promoted = True
 
                 # Update KB if position changed
                 if (box_grid_x, box_grid_y) != (self.kb.box_x, self.kb.box_y):
                     print(
                         f"      [LIDAR] Box re-detected at ({box_grid_x}, {box_grid_y})"
                     )
+                    # DEBUG: Show conversion details
+                    print(
+                        f"        [CONVERT-DEBUG] Robot pose(internal): ({robot_x:.3f},{robot_y:.3f}) grid=({rx},{ry}), yaw={math.degrees(robot_yaw):.1f}°"
+                    )
+                    print(
+                        f"        [CONVERT-DEBUG] LiDAR ray: angle={math.degrees(angle):.1f}°, dist={distance:.3f}m → abs_angle={math.degrees(abs_angle):.1f}°"
+                    )
+                    print(
+                        f"        [CONVERT-DEBUG] Hit meters: ({hit_x:.3f},{hit_y:.3f}) → grid_raw=({box_grid_x_raw},{box_grid_y_raw})"
+                    )
+                    if promoted:
+                        print(
+                            f"        [CONVERT-DEBUG] Diagonal promotion applied: ({box_grid_x_raw},{box_grid_y_raw}) → ({box_grid_x},{box_grid_y})"
+                        )
                     if self.kb.box_found:
                         self.kb.move_box(box_grid_x, box_grid_y)
                     else:

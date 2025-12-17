@@ -99,8 +99,13 @@ def main():
 
     # Initial scan to populate KB around start position
     print("\n[5] Initial LiDAR scan...")
-    controller.scan_lidar(visualize=realtime)
+    scan_data = controller.scan_lidar(visualize=realtime)
     knowledge.print_grid()
+
+    # Record wall landmarks from known position (0,0) for later recalibration
+    print("\n[6] Recording wall landmarks from initial position...")
+    num_landmarks = controller.record_wall_landmarks(scan_data)
+    print(f"    Recorded {num_landmarks} wall landmarks for drift correction")
 
     # Create mission controller
     mission = MissionController(
@@ -110,7 +115,7 @@ def main():
     )
 
     # Run the full mission
-    print("\n[6] Starting mission...")
+    print("\n[7] Starting mission...")
     success = mission.run_full_mission(realtime=realtime)
 
     # Final state
