@@ -48,6 +48,7 @@ def integrate_lidar(
     cell_size: float,
     max_range: float,
     is_obstacle: Optional[Callable[[int], bool]] = None,
+    actual_robot_internal: Optional[tuple[int, int, float]] = None,
 ) -> None:
     """
     Mapping update rule: integrate LiDAR rays into the KB occupancy grid.
@@ -60,12 +61,20 @@ def integrate_lidar(
         is_obstacle: optional predicate on obj_id; if provided, only hits where
             is_obstacle(obj_id) is True are treated as OCC at the ray endpoint.
             Useful for filtering out non-walls (e.g., ignore goal markers).
+        actual_robot_internal: optional (grid_x, grid_y, yaw_rad) of actual robot position
+            in internal frame. If provided, uses this instead of KB robot position to
+            calculate hit locations. This fixes frame offset issues when internal pose
+            drifts from actual.
     """
     if kb.robot is None:
         raise ValueError("Robot pose not set")
 
-    rx, ry, heading = kb.robot.x, kb.robot.y, kb.robot.heading
-    heading_yaw = ORIENTATION_ANGLES[heading]
+    # Use actual position if provided, otherwise fall back to KB position
+    if actual_robot_internal is not None:
+        rx, ry, heading_yaw = actual_robot_internal
+    else:
+        rx, ry = kb.robot.x, kb.robot.y
+        heading_yaw = ORIENTATION_ANGLES[kb.robot.heading]
 
     for ang, dist_m, obj_id in scan_data:
         # Clamp distance to match range of LiDAR

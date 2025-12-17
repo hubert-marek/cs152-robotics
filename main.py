@@ -46,8 +46,8 @@ def main():
     print(
         f"    Grid: {env['grid_size']}x{env['grid_size']} cells ({simulation.CELL_SIZE}m each)"
     )
-    print(f"    Box at: {env['box_grid']} (unknown to robot)")
-    print(f"    Goal at: {env['goal_grid']} (known to robot)")
+    print(f"    Box at (world grid): {env['box_grid']} (unknown to robot)")
+    print(f"    Goal at (world grid): {env['goal_grid']} (known to robot)")
 
     # Robot's internal frame: starts at (0,0)
     # Convert world coordinates to internal frame
@@ -57,6 +57,11 @@ def main():
     goal_internal = (
         env["goal_grid"][0] - pybullet_start[0],
         env["goal_grid"][1] - pybullet_start[1],
+    )
+    # Box position in internal frame (debug-only; robot does not know it)
+    box_internal = (
+        env["box_grid"][0] - pybullet_start[0],
+        env["box_grid"][1] - pybullet_start[1],
     )
 
     # Initialize Knowledge Base (cells start as UNKNOWN for exploration)
@@ -72,6 +77,7 @@ def main():
     knowledge.set_goal(*goal_internal)
     print("    All cells start as UNKNOWN (exploration mode)")
     print(f"    Goal marked at: {goal_internal} (internal frame)")
+    print(f"    Box (debug only): {box_internal} (internal frame)")
 
     # Load robot at PyBullet position (internal frame is (0,0))
     start_heading = EAST
@@ -97,13 +103,10 @@ def main():
     knowledge.print_grid()
 
     # Create mission controller
-    # Toggle magnet/suction-style "gripper" (implemented as a fixed constraint on contact).
-    USE_MAGNET_GRIPPER = True
     mission = MissionController(
         controller,
         knowledge,
         box_id=env["box_id"],
-        use_magnet_gripper=USE_MAGNET_GRIPPER,
     )
 
     # Run the full mission

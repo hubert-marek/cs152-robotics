@@ -81,6 +81,8 @@ class Lidar:
         position, yaw = self._get_lidar_pose()
 
         ray_from, ray_to, angles = [], [], []
+        ray_len = max(0.0, self.max_range - self.ray_start_offset)
+
         for i in range(self.num_rays):
             angle = (2 * math.pi * i) / self.num_rays
             world_angle = yaw + angle
@@ -93,11 +95,10 @@ class Lidar:
             ]
             ray_from.append(start)
 
+            # IMPORTANT: end at max_range from the sensor origin (not offset+range)
             end = [
-                position[0]
-                + (self.ray_start_offset + self.max_range) * math.cos(world_angle),
-                position[1]
-                + (self.ray_start_offset + self.max_range) * math.sin(world_angle),
+                position[0] + self.max_range * math.cos(world_angle),
+                position[1] + self.max_range * math.sin(world_angle),
                 position[2],
             ]
             ray_to.append(end)
@@ -108,7 +109,14 @@ class Lidar:
         for i, result in enumerate(results):
             hit_id = result[0]
             hit_fraction = result[2]
-            distance = hit_fraction * self.max_range if hit_id != -1 else self.max_range
+
+            if hit_id == -1:
+                distance = self.max_range
+            else:
+                # hit_fraction is along [ray_from, ray_to]; convert to distance from sensor origin
+                distance = self.ray_start_offset + hit_fraction * ray_len
+                distance = min(self.max_range, max(0.0, distance))
+
             scan_data.append((angles[i], distance, hit_id))
 
         if visualize:
@@ -306,12 +314,46 @@ class RobotController:
         return True
 
     def get_actual_pose(self) -> dict:
-        """Get actual pose from PyBullet (debug utility; avoid for estimation/control)."""
+        """
+        Get actual pose from PyBullet (debug utility; avoid for estimation/control).
+
+        Note on frames:
+        - PyBullet reports WORLD coordinates.
+        - This project uses an INTERNAL grid frame where the robot starts at (0,0),
+          which (in `main.py`) corresponds to a PyBullet start cell like (1,1).
+        - If KB bounds are set, we can infer the world→internal translation from them:
+          internal_grid = world_grid + min_x/min_y, and internal_meters = world_meters + min_x*CELL_SIZE.
+        """
         pos, orn = pybullet.getBasePositionAndOrientation(self.robot_id)
         euler = pybullet.getEulerFromQuaternion(orn)
+
+        # Infer world→internal translation from KB bounds (set in main.py).
+        if getattr(self.kb, "bounds", None) is not None:
+            min_x, _, min_y, _ = self.kb.bounds
+        else:
+            min_x, min_y = 0, 0
+
+        # Convert world meters to internal meters via translation.
+        x_internal = pos[0] + (min_x * CELL_SIZE)
+        y_internal = pos[1] + (min_y * CELL_SIZE)
+
+        # Grid conversions for convenience (both frames).
+        grid_x_world = int(round((pos[0] - CELL_SIZE / 2) / CELL_SIZE))
+        grid_y_world = int(round((pos[1] - CELL_SIZE / 2) / CELL_SIZE))
+        grid_x_internal = int(round((x_internal - CELL_SIZE / 2) / CELL_SIZE))
+        grid_y_internal = int(round((y_internal - CELL_SIZE / 2) / CELL_SIZE))
+
         return {
+            # World frame (PyBullet)
             "x": pos[0],
             "y": pos[1],
+            "grid_x_world": grid_x_world,
+            "grid_y_world": grid_y_world,
+            # Internal frame (KB/mission/planning)
+            "x_internal": x_internal,
+            "y_internal": y_internal,
+            "grid_x_internal": grid_x_internal,
+            "grid_y_internal": grid_y_internal,
             "yaw": euler[2],
             "yaw_deg": math.degrees(euler[2]),
         }
@@ -601,9 +643,26 @@ class RobotController:
             grid_y: Target grid cell Y
             heading: Target heading (NORTH/EAST/SOUTH/WEST)
         """
+        # DEBUG: Show before/after snap
+        old_x, old_y = self.pose_x, self.pose_y
+        actual = self.get_actual_pose()
+
         self.pose_x = grid_x * CELL_SIZE + CELL_SIZE / 2
         self.pose_y = grid_y * CELL_SIZE + CELL_SIZE / 2
         self.pose_yaw = ORIENTATION_ANGLES[heading]
+
+        # Calculate how much we corrected
+        correction = math.sqrt((self.pose_x - old_x) ** 2 + (self.pose_y - old_y) ** 2)
+        # Compare against actual pose in INTERNAL frame (world is translated).
+        actual_error = math.sqrt(
+            (self.pose_x - actual["x_internal"]) ** 2
+            + (self.pose_y - actual["y_internal"]) ** 2
+        )
+
+        print(
+            f"      [SNAP] Grid ({grid_x},{grid_y}) h={heading}: correction={correction:.3f}m, actual_error={actual_error:.3f}m "
+            f"[world=({actual['x']:.3f},{actual['y']:.3f})]"
+        )
 
     def _calibrate_turn_direction_if_needed(self, realtime=False):
         if self._ccw_command_increases_yaw is not None:
@@ -673,6 +732,20 @@ class RobotController:
         target_x = target_grid_x * CELL_SIZE + CELL_SIZE / 2
         target_y = target_grid_y * CELL_SIZE + CELL_SIZE / 2
 
+        # DEBUG: Log starting state
+        actual = self.get_actual_pose()
+        print(
+            f"    [NAV-START] Target grid=({target_grid_x},{target_grid_y}) heading={target_heading}"
+        )
+        print(
+            f"      Internal: pos=({self.pose_x:.3f},{self.pose_y:.3f}) yaw={math.degrees(self.pose_yaw):.1f}°"
+        )
+        print(
+            f"      Actual:   pos=({actual['x_internal']:.3f},{actual['y_internal']:.3f}) yaw={actual['yaw_deg']:.1f}° "
+            f"[world=({actual['x']:.3f},{actual['y']:.3f})]"
+        )
+        print(f"      Target:   pos=({target_x:.3f},{target_y:.3f})")
+
         self._reset_odometry()
         self._calibrate_turn_direction_if_needed(realtime)
 
@@ -697,8 +770,8 @@ class RobotController:
             dy = target_y - self.pose_y
             distance = math.sqrt(dx * dx + dy * dy)
 
-            # Check if arrived
-            if distance < CELL_SIZE * 0.15:  # Within 15% of cell size
+            # Check if arrived (within 2% of cell size = 2.5cm)
+            if distance < CELL_SIZE * 0.05:
                 reached = True
                 break
 
@@ -706,8 +779,10 @@ class RobotController:
             target_angle = math.atan2(dy, dx)
             yaw_error = normalize_angle(target_angle - self.pose_yaw)
 
-            # Proportional speed control
-            proportion = min(1.0, distance / CELL_SIZE)
+            # Proportional speed control - slow down more when close
+            proportion = min(
+                1.0, distance / (CELL_SIZE * 0.5)
+            )  # Start slowing at half cell
             speed = self.MIN_MOVE_SPEED + proportion * (
                 self.MAX_MOVE_SPEED - self.MIN_MOVE_SPEED
             )
@@ -724,13 +799,41 @@ class RobotController:
         self._stop()
         self._wait_and_step(10, realtime=False)
 
-        # Debug: show arrival accuracy
+        # DEBUG: Show arrival accuracy - compare internal vs actual
         final_dx = target_x - self.pose_x
         final_dy = target_y - self.pose_y
         final_dist = math.sqrt(final_dx * final_dx + final_dy * final_dy)
+
+        actual = self.get_actual_pose()
+        actual_dx = target_x - actual["x_internal"]
+        actual_dy = target_y - actual["y_internal"]
+        actual_dist = math.sqrt(actual_dx * actual_dx + actual_dy * actual_dy)
+
+        internal_grid_x = int(round((self.pose_x - CELL_SIZE / 2) / CELL_SIZE))
+        internal_grid_y = int(round((self.pose_y - CELL_SIZE / 2) / CELL_SIZE))
+        actual_grid_x = actual["grid_x_internal"]
+        actual_grid_y = actual["grid_y_internal"]
+
         print(
-            f"    [NAV] Waypoint ({target_grid_x},{target_grid_y}): arrived={reached}, error={final_dist:.3f}m"
+            f"    [NAV-END] Waypoint ({target_grid_x},{target_grid_y}): arrived={reached}"
         )
+        print(
+            f"      Internal: pos=({self.pose_x:.3f},{self.pose_y:.3f}) grid=({internal_grid_x},{internal_grid_y}) error={final_dist:.3f}m"
+        )
+        print(
+            f"      Actual:   pos=({actual['x_internal']:.3f},{actual['y_internal']:.3f}) grid=({actual_grid_x},{actual_grid_y}) error={actual_dist:.3f}m "
+            f"[world=({actual['x']:.3f},{actual['y']:.3f}), grid=({actual['grid_x_world']},{actual['grid_y_world']})]"
+        )
+
+        # WARN if internal and actual disagree on grid cell
+        if (internal_grid_x, internal_grid_y) != (actual_grid_x, actual_grid_y):
+            print(
+                f"      ⚠️  GRID MISMATCH! Internal thinks ({internal_grid_x},{internal_grid_y}) but actually at ({actual_grid_x},{actual_grid_y})"
+            )
+        if (internal_grid_x, internal_grid_y) != (target_grid_x, target_grid_y):
+            print(
+                f"      ⚠️  MISSED TARGET! Target was ({target_grid_x},{target_grid_y})"
+            )
 
         # Phase 3: Final heading correction (if specified)
         if target_heading is not None:

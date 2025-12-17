@@ -20,6 +20,7 @@ from kb import (
     SOUTH,
     WEST,
     DIRECTION_VECTORS,
+    UNKNOWN,
     FREE,
     OCC,
 )
@@ -477,11 +478,18 @@ def plan_box_delivery(
         return kb.get_cell(x, y)
 
     def is_cell_free(x: int, y: int, box_pos: tuple[int, int]) -> bool:
-        """Check if robot can occupy the cell, given a dynamic box position."""
+        """
+        Check if robot can occupy the cell, given a dynamic box position.
+
+        During delivery replanning we allow the *robot* to traverse UNKNOWN cells
+        (optimistic), otherwise the planner can easily return None on partially
+        explored maps. We still forbid pushing the box into UNKNOWN by requiring
+        the box destination cell be FREE (see push check below).
+        """
         if (x, y) == box_pos:
             return False  # Can't walk through the box (unless pushing)
         state = static_cell_state(x, y)
-        return state == FREE  # keep UNKNOWN non-traversable for safety
+        return state == FREE or state == UNKNOWN
 
     def is_cell_empty_for_box(x: int, y: int) -> bool:
         """Check if cell is valid for box to move into (not wall, not goal-blocking)."""
