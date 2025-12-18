@@ -112,28 +112,6 @@ class KnowledgeBase:
         self.visited.add((grid_x, grid_y))
         self.mark_free(grid_x, grid_y)
 
-    def move_robot(self, new_x: int, new_y: int) -> None:
-        """Move robot to a new grid cell (keeps current heading)."""
-        if self.robot is None:
-            raise ValueError("Robot pose not set")
-        if not self.in_bounds(new_x, new_y):
-            raise ValueError(f"Robot move out of bounds: ({new_x}, {new_y})")
-        self.robot.x = new_x
-        self.robot.y = new_y
-        self.visited.add((new_x, new_y))
-        self.mark_free(new_x, new_y)
-
-    def step_turn(self, direction: str) -> None:
-        """Update robot heading after a discrete turn ('left'/'right')."""
-        if self.robot is None:
-            raise ValueError("Robot pose not set")
-        if direction == "left":
-            self.robot.heading = (self.robot.heading - 1) % 4
-        elif direction == "right":
-            self.robot.heading = (self.robot.heading + 1) % 4
-        else:
-            raise ValueError("direction must be 'left' or 'right'")
-
     def set_goal(self, x: int, y: int) -> None:
         """Set the goal cell (treated as traversable)."""
         if not self.in_bounds(x, y):
@@ -163,10 +141,6 @@ class KnowledgeBase:
         self.box = (new_x, new_y)
         # Same rationale as in set_box(): keep dynamic box out of occ grid.
         self.mark_free(new_x, new_y)
-
-    def clear_box(self) -> None:
-        """Clear box knowledge (does not modify occupancy)."""
-        self.box = None
 
     # Convenience properties
 
@@ -205,29 +179,9 @@ class KnowledgeBase:
 
     # Convenience methods
 
-    def get_cell_ahead(self) -> tuple[int, int]:
-        """Get grid cell directly ahead of robot."""
-        dx, dy = DIRECTION_VECTORS[self.robot_heading]
-        return (self.robot_x + dx, self.robot_y + dy)
-
     def is_box_at_goal(self) -> bool:
         """Check if box is at goal position."""
         return self.box is not None and self.goal is not None and self.box == self.goal
-
-    def update_from_move(self, direction: str) -> None:
-        """Update KB after robot moves ('forward' or 'backward')."""
-        dx, dy = DIRECTION_VECTORS[self.robot_heading]
-        if direction == "forward":
-            new_x, new_y = self.robot_x + dx, self.robot_y + dy
-        elif direction == "backward":
-            new_x, new_y = self.robot_x - dx, self.robot_y - dy
-        else:
-            raise ValueError("direction must be 'forward' or 'backward'")
-        self.move_robot(new_x, new_y)
-
-    def update_from_turn(self, direction: str) -> None:
-        """Update KB after robot turns ('left' or 'right'). Alias for step_turn."""
-        self.step_turn(direction)
 
     def get_robot_state(self) -> str:
         """Get human-readable robot state string."""

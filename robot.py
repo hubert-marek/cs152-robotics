@@ -162,19 +162,6 @@ class Lidar:
                     start, end, color, lineWidth=2, replaceItemUniqueId=self.ray_ids[i]
                 )
 
-    def get_obstacle_in_front(self, scan_data, front_angle_range=math.pi / 4):
-        """Check for obstacle in front. Returns (distance, object_id) or (None, None)."""
-        min_dist = self.max_range
-        closest_id = -1
-
-        for angle, distance, obj_id in scan_data:
-            norm_angle = angle if angle <= math.pi else angle - 2 * math.pi
-            if abs(norm_angle) <= front_angle_range and distance < min_dist:
-                min_dist = distance
-                closest_id = obj_id
-
-        return (min_dist, closest_id) if closest_id != -1 else (None, None)
-
 
 # =============================================================================
 
@@ -216,7 +203,7 @@ class RobotController:
 
         # Internal coordinate frame:
         # - Grid cell (0,0) center is at (CELL_SIZE/2, CELL_SIZE/2)
-        # - This matches `move_to_waypoint()` targets and `snap_pose_to_grid()`
+        # - This matches `move_to_waypoint()` targets
         self.pose_x = CELL_SIZE / 2
         self.pose_y = CELL_SIZE / 2
         self.pose_yaw = 0.0
@@ -231,90 +218,6 @@ class RobotController:
 
         self.lidar = Lidar(robot_id)
         self._ccw_command_increases_yaw = None
-        # Optional "magnet gripper" (implemented as a temporary fixed constraint). #TODO, remove all code related to magnet gripper - it is no longer needed
-        # Disabled unless explicitly used by the mission/controller.
-        self._grip_constraint_id: int | None = None
-
-    # --- Optional Gripper / Magnet (Constraint-Based Attachment) ---
-
-    def is_gripping(self) -> bool:
-        return self._grip_constraint_id is not None
-
-    def release_grip(self) -> None:
-        """Release the magnet/gripper constraint if active."""
-        if self._grip_constraint_id is None:
-            return
-        try:
-            pybullet.removeConstraint(self._grip_constraint_id)
-        finally:
-            self._grip_constraint_id = None
-
-    def grip(
-        self,
-        body_id: int,
-        *,
-        max_force: float = 500.0,
-        require_contact: bool = True,
-    ) -> bool:
-        """
-        Attach to a body using a fixed constraint (simulated magnet/gripper).
-
-        This is NOT a physical jaw gripper; it's a convenience tool to model a
-        magnetic coupler or suction cup that can rigidly attach once contact
-        is established.
-
-        Args:
-            body_id: PyBullet body to attach to (e.g. the box)
-            max_force: constraint max force
-            require_contact: if True, only grip when currently in contact
-
-        Returns:
-            True if grip is active after the call.
-        """
-        if self._grip_constraint_id is not None:
-            return True
-
-        contacts = pybullet.getContactPoints(bodyA=self.robot_id, bodyB=body_id)
-        if require_contact and not contacts:
-            return False
-
-        # Prefer the first contact point to define the attachment pivots.
-        # If there is no contact (require_contact=False), fall back to body origins.
-        if contacts:
-            # contact[5] = positionOnA (world), contact[6] = positionOnB (world)
-            world_pivot_a = contacts[0][5]
-            world_pivot_b = contacts[0][6]
-        else:
-            world_pivot_a, _ = pybullet.getBasePositionAndOrientation(self.robot_id)
-            world_pivot_b, _ = pybullet.getBasePositionAndOrientation(body_id)
-
-        # Convert world pivots into each body's local frame
-        a_pos, a_orn = pybullet.getBasePositionAndOrientation(self.robot_id)
-        b_pos, b_orn = pybullet.getBasePositionAndOrientation(body_id)
-
-        a_inv_pos, a_inv_orn = pybullet.invertTransform(a_pos, a_orn)
-        b_inv_pos, b_inv_orn = pybullet.invertTransform(b_pos, b_orn)
-
-        local_pivot_a, _ = pybullet.multiplyTransforms(
-            a_inv_pos, a_inv_orn, world_pivot_a, (0, 0, 0, 1)
-        )
-        local_pivot_b, _ = pybullet.multiplyTransforms(
-            b_inv_pos, b_inv_orn, world_pivot_b, (0, 0, 0, 1)
-        )
-
-        cid = pybullet.createConstraint(
-            parentBodyUniqueId=self.robot_id,
-            parentLinkIndex=-1,
-            childBodyUniqueId=body_id,
-            childLinkIndex=-1,
-            jointType=pybullet.JOINT_FIXED,
-            jointAxis=(0, 0, 0),
-            parentFramePosition=local_pivot_a,
-            childFramePosition=local_pivot_b,
-        )
-        pybullet.changeConstraint(cid, maxForce=max_force)
-        self._grip_constraint_id = cid
-        return True
 
     def get_actual_pose(self) -> dict:
         """
@@ -487,13 +390,6 @@ class RobotController:
         _, angular_vel = pybullet.getBaseVelocity(self.robot_id)
         return angular_vel[2]
 
-    def _get_distance_traveled(self):
-        left = self._get_wheel_position(LEFT_WHEEL_JOINT)
-        right = self._get_wheel_position(RIGHT_WHEEL_JOINT)
-        left_dist = (left - self.last_left_pos) * WHEEL_RADIUS
-        right_dist = (right - self.last_right_pos) * WHEEL_RADIUS
-        return (left_dist + right_dist) / 2
-
     def _reset_odometry(self):
         self.last_left_pos = self._get_wheel_position(LEFT_WHEEL_JOINT)
         self.last_right_pos = self._get_wheel_position(RIGHT_WHEEL_JOINT)
@@ -513,9 +409,8 @@ class RobotController:
         Uses velocity-based distance tracking (more reliable than wheel odometry
         which can have encoder issues) and gyroscope for heading.
 
-        NOTE: LiDAR recalibration is DISABLED - it was causing drift by recording #TODO isn't this comment outdated as we are now colling recallibrate from LIdAR and veryfing based on knwoeldge about right angle of walls?
-        landmarks from already-drifted positions. We rely on pose snapping after
-        each waypoint to prevent drift accumulation.
+        LiDAR-based recalibration is performed separately via `_recalibrate_from_lidar()`
+        which uses wall landmarks and axis-aligned constraints to correct accumulated drift.
 
         Args:
             dt: Time step (defaults to TIME_STEP)
@@ -1099,49 +994,6 @@ class RobotController:
             "grid_y": int(round((self.pose_y - CELL_SIZE / 2) / CELL_SIZE)),
         }
 
-    def snap_pose_to_grid(self, grid_x: int, grid_y: int, heading: int) -> None:
-        """
-        Force internal pose to match a specific grid cell center.
-
-        Used after plan execution to prevent drift accumulation. The physical
-        robot may have drifted slightly, but we trust the plan execution
-        and reset our internal estimate to the expected position.
-
-        Args:
-            grid_x: Target grid cell X
-            grid_y: Target grid cell Y
-            heading: Target heading (NORTH/EAST/SOUTH/WEST)
-        """
-        # DEBUG: Show before/after snap
-        old_x, old_y = self.pose_x, self.pose_y
-        actual = self.get_actual_pose()
-
-        self.pose_x = grid_x * CELL_SIZE + CELL_SIZE / 2
-        self.pose_y = grid_y * CELL_SIZE + CELL_SIZE / 2
-        self.pose_yaw = ORIENTATION_ANGLES[heading]
-
-        # Calculate how much we corrected
-        correction = math.sqrt((self.pose_x - old_x) ** 2 + (self.pose_y - old_y) ** 2)
-        # Compare against actual pose in INTERNAL frame (world is translated).
-        actual_error = math.sqrt(
-            (self.pose_x - actual["x_internal"]) ** 2
-            + (self.pose_y - actual["y_internal"]) ** 2
-        )
-
-        # DEBUG: Show coordinate conversion details if correction is significant
-        if correction > 0.02:
-            print(
-                f"      [SNAP-DEBUG] Conversion: grid({grid_x},{grid_y}) → meters({self.pose_x:.3f},{self.pose_y:.3f})"
-            )
-            print(
-                f"      [SNAP-DEBUG] Internal pose: before=({old_x:.3f},{old_y:.3f}), after=({self.pose_x:.3f},{self.pose_y:.3f})"
-            )
-
-        print(
-            f"      [SNAP] Grid ({grid_x},{grid_y}) h={heading}: correction={correction:.3f}m, actual_error={actual_error:.3f}m "
-            f"[world=({actual['x']:.3f},{actual['y']:.3f})]"
-        )
-
     def _calibrate_turn_direction_if_needed(self, realtime=False):
         if self._ccw_command_increases_yaw is not None:
             return
@@ -1372,11 +1224,12 @@ class RobotController:
 
         self._stop()
 
-    def move(
-        self, direction: str, realtime=False, snap_yaw=True
-    ):  # TODO if this is legacy why do we keep it?
+    def move(self, direction: str, realtime=False, snap_yaw=True):
         """
-        Move one cell in given direction (legacy discrete method).
+        Move one cell in given direction.
+
+        Used for safety backup maneuvers (e.g., backing up before turning
+        when in contact with the box).
 
         Args:
             direction: 'forward' or 'backward'
@@ -1419,12 +1272,3 @@ class RobotController:
 
         if snap_yaw:
             self._snap_to_kb_yaw(realtime)
-
-    def turn(
-        self, direction: str, realtime=False
-    ):  # TODO DO we actually need it if we have turn to angle
-        """Turn 90° in given direction ('left' or 'right')."""
-        # Relative 90° turn using gyro-integrated yaw estimate (no KB dependency).
-        delta = math.pi / 2 if direction == "left" else -math.pi / 2
-        self._turn_to_angle(normalize_angle(self.pose_yaw + delta), realtime)
-        self._wait_and_step(30, realtime=False)  # Extra settling for compact robot

@@ -28,13 +28,6 @@ if TYPE_CHECKING:
     from kb import KnowledgeBase
 
 
-# When True, forcibly snap the internal continuous pose estimate to planned grid
-# centers after each waypoint/action. This can mask estimator drift, but if the
-# robot does not physically reach the planned cell it will de-sync pose from
-# LiDAR observations and break box re-detection/push verification.
-SNAP_INTERNAL_POSE = False  # TODO I think now we can safley remove all snapping functionality? As I understanding it is bascially faking internal readings?
-
-
 class MissionController:
     """
     Executes high-level missions using planning algorithms.
@@ -172,10 +165,6 @@ class MissionController:
 
         # Sync KB to TARGET waypoint (not drifted pose!)
         self.kb.set_robot(x, y, heading)
-
-        # Optionally snap internal pose to grid cell center. #TODO this to remove?
-        if SNAP_INTERNAL_POSE:
-            self.robot.snap_pose_to_grid(x, y, heading)
 
         print(
             f"    [DEBUG] KB now at: ({self.kb.robot_x}, {self.kb.robot_y}) h={self.kb.robot_heading}"
@@ -624,8 +613,6 @@ class MissionController:
                 # Recalibrate after turn to sync yaw estimate
                 self.robot.scan_lidar(visualize=True, recalibrate=True)
                 self.kb.set_robot(robot_x, robot_y, new_heading)
-                if SNAP_INTERNAL_POSE:
-                    self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
             elif action == "turn_right":
                 print(
                     f"      [EXEC] Turning right: heading {current_heading} → {(current_heading + 1) % 4}"
@@ -662,8 +649,6 @@ class MissionController:
                 # Recalibrate after turn to sync yaw estimate
                 self.robot.scan_lidar(visualize=True, recalibrate=True)
                 self.kb.set_robot(robot_x, robot_y, new_heading)
-                if SNAP_INTERNAL_POSE:
-                    self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
             elif action == "move_forward":
                 dx, dy = DIRECTION_VECTORS[current_heading]
                 target_x = robot_x + dx
@@ -792,8 +777,6 @@ class MissionController:
                     f"        [KB-UPDATE] Robot: ({robot_x},{robot_y}) → ({target_x},{target_y})"
                 )
                 self.kb.set_robot(target_x, target_y, current_heading)
-                if SNAP_INTERNAL_POSE:
-                    self.robot.snap_pose_to_grid(target_x, target_y, current_heading)
             else:
                 raise ValueError(f"Unknown delivery action: {action}")
 
