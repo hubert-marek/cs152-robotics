@@ -133,7 +133,7 @@ def astar(
     # State includes heading because turning has a cost for diff-drive robots
     # This is different from standard grid A* which only tracks (x,y)
     initial_state = (start[0], start[1], start_heading)
-    
+
     # Priority queue: (f_score, g_score, state, path)
     # Using f as primary sort key for A* optimality
     open_set: list[

@@ -145,7 +145,6 @@ cs152-robotics/
 │   ├── README.md
 │   ├── controller.md
 │   └── coordinate_transforms.md
-└── PybulletRobotics/ # Reference URDF files
-    └── urdf/
-        └── simple_two_wheel_car.urdf
+└── urdf/             # Robot URDF file
+    └── simple_two_wheel_car.urdf
 ```

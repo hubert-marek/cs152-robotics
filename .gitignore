@@ -48,5 +48,7 @@ metrics_*.json
 # uv
 .python-version
 
+PybulletRobotics/
+
 # Misc
 other/

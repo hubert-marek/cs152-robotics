@@ -235,7 +235,6 @@ def load_robot(start_grid_pos: tuple[int, int], start_orientation: int) -> int:
 
     urdf_path = os.path.join(
         os.path.dirname(__file__),
-        "PybulletRobotics",
         "urdf",
         "simple_two_wheel_car.urdf",
     )
