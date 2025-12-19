@@ -258,7 +258,7 @@ class KnowledgeBase:
         """
         fr: set[tuple[int, int]] = set()
         # Iterate over all the cells in the grid
-        for (x, y), state in self.occ.items():
+        for (x, y), state in list(self.occ.items()):
             # If the cell is not FREE, skip it
             if state != FREE:
                 continue
