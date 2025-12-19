@@ -208,8 +208,10 @@ class RobotController:
         self.pose_y = CELL_SIZE / 2
         self.pose_yaw = 0.0
 
-        # Discovered wall positions (landmarks for recalibration) #TODO here we need to update the code to actually use algorithm for calssyfing walls. I thin kit should be easy, bascially make a datastrcutre that stores data from the entry
-        #  (remember that north, south etc is all relevative - north is where robot starts), and then if a new wall is detected (the object size is bigger than box, i.e. bigger than 60 cm widfgt based on visible rays), check the angle of this, and verify against the internal measurments assgign ID to this wall and mark it as east, north or west etc.
+        # Discovered wall positions (landmarks for recalibration).
+        # Uses PyBullet body IDs for wall identification. A more realistic approach
+        # would classify walls by LiDAR signature (size > box width ~0.6m, axis-aligned),
+        # but body IDs are reliable and sufficient for this simulation.
         self._wall_landmarks = {}
         # Map PyBullet wall body id -> semantic wall type ("east"/"west"/"north"/"south").
         # This prevents the recalibration math from ever "matching" a north-wall hit to
@@ -279,10 +281,6 @@ class RobotController:
         simulation.step(LIDAR_SCAN_STEPS)
 
         scan_data = self.lidar.scan(visualize=visualize)
-
-        # Debug: show scan stats
-        hits = sum(1 for _, _, oid in scan_data if oid != -1)
-        print(f"  [DEBUG] LiDAR scan: {len(scan_data)} rays, {hits} hits")
 
         # Optionally recalibrate pose using wall landmarks BEFORE updating the KB.
         # IMPORTANT: if recalibration changes our best pose estimate, we also
@@ -853,25 +851,14 @@ class RobotController:
                 if abs(dy) > 0.005:
                     self.pose_y -= dy * 0.5
 
+        # Only log significant corrections (> 5cm)
         if corrections_made:
-            print(f"    [RECALIB] {', '.join(corrections_made)}")
-
-            # DEBUG: Show details of wall rays used for recalibration
             total_correction = math.sqrt(
                 (self.pose_x - pose_before_x) ** 2 + (self.pose_y - pose_before_y) ** 2
             )
-            if total_correction > 0.15:  # Log if correction is large (> 15cm)
+            if total_correction > 0.05:
                 print(
-                    f"      [DEBUG] Large correction! Total={total_correction:.3f}m from {len(wall_ray_samples)} wall rays:"
-                )
-                for i, (wall_name, d_m, d_e) in enumerate(wall_ray_samples[:5]):
-                    print(
-                        f"        Ray {i + 1}: {wall_name} wall, measured={d_m:.3f}m, expected={d_e:.3f}m, error={(d_m - d_e):+.3f}m"
-                    )
-                if len(wall_ray_samples) > 5:
-                    print(f"        ... and {len(wall_ray_samples) - 5} more rays")
-                print(
-                    f"      [DEBUG] Landmarks: {dict((k, f'{v:.3f}m') for k, v in self._wall_landmarks.items())}"
+                    f"    Recalibration: {', '.join(corrections_made)} ({total_correction:.2f}m)"
                 )
 
     def record_wall_landmarks(self, scan_data: list = None) -> int:
@@ -970,16 +957,6 @@ class RobotController:
                 if count >= 3:
                     self._wall_id_to_type[wall_id] = wall_type
 
-            axis = "X" if wall_type in ("east", "west") else "Y"
-            if old_val is None:
-                print(
-                    f"    [LANDMARK] New: {wall_type} wall at {axis}={wall_pos:.3f}m (n={len(samples)})"
-                )
-            elif abs(old_val - wall_pos) > 0.05:
-                print(
-                    f"    [LANDMARK] Updated: {wall_type} wall {axis}: {old_val:.3f}→{wall_pos:.3f}m"
-                )
-
         return recorded
 
     def get_pose(self) -> dict:
@@ -1036,7 +1013,7 @@ class RobotController:
 
     # --- High-level movement primitives ---
 
-    def move_to_waypoint(  # TODO Here I think again more explinations, and I am aslo thinkiing if this shouldnt be refractortd to mission planner, and in robot we just keep the controller? But I am open to leaving this but want to hear your opinion
+    def move_to_waypoint(
         self,
         target_grid_x: int,
         target_grid_y: int,
@@ -1045,6 +1022,10 @@ class RobotController:
     ) -> bool:
         """
         Navigate to target grid cell using continuous pose estimation.
+
+        This method lives in RobotController (not MissionController) because it
+        encapsulates low-level control: proportional speed control, heading hold,
+        and timeout handling. The mission layer only specifies waypoints.
 
         Uses internal pose tracking (sensor fusion) to reach target,
         not discrete step counting.
@@ -1061,20 +1042,6 @@ class RobotController:
         # Target position in internal frame (grid cells centered at cell_size/2)
         target_x = target_grid_x * CELL_SIZE + CELL_SIZE / 2
         target_y = target_grid_y * CELL_SIZE + CELL_SIZE / 2
-
-        # DEBUG: Log starting state
-        actual = self.get_actual_pose()
-        print(
-            f"    [NAV-START] Target grid=({target_grid_x},{target_grid_y}) heading={target_heading}"
-        )
-        print(
-            f"      Internal: pos=({self.pose_x:.3f},{self.pose_y:.3f}) yaw={math.degrees(self.pose_yaw):.1f}°"
-        )
-        print(
-            f"      Actual:   pos=({actual['x_internal']:.3f},{actual['y_internal']:.3f}) yaw={actual['yaw_deg']:.1f}° "
-            f"[world=({actual['x']:.3f},{actual['y']:.3f})]"
-        )
-        print(f"      Target:   pos=({target_x:.3f},{target_y:.3f})")
 
         self._reset_odometry()
         self._calibrate_turn_direction_if_needed(realtime)
@@ -1152,46 +1119,8 @@ class RobotController:
         final_dy = target_y - self.pose_y
         final_dist = math.sqrt(final_dx * final_dx + final_dy * final_dy)
 
-        # DEBUG: Warn if recalibration made arrival WORSE
-        if abs(final_dist - pre_recalib_dist) > 0.05:
-            delta_sign = "worse" if final_dist > pre_recalib_dist else "better"
-            print(
-                f"      [DEBUG] Recalib changed distance-to-target: {pre_recalib_dist:.3f}m → {final_dist:.3f}m ({delta_sign})"
-            )
-
         # Re-evaluate arrival after recalibration
         reached = final_dist < CELL_SIZE * 0.08
-
-        actual = self.get_actual_pose()
-        actual_dx = target_x - actual["x_internal"]
-        actual_dy = target_y - actual["y_internal"]
-        actual_dist = math.sqrt(actual_dx * actual_dx + actual_dy * actual_dy)
-
-        internal_grid_x = int(round((self.pose_x - CELL_SIZE / 2) / CELL_SIZE))
-        internal_grid_y = int(round((self.pose_y - CELL_SIZE / 2) / CELL_SIZE))
-        actual_grid_x = actual["grid_x_internal"]
-        actual_grid_y = actual["grid_y_internal"]
-
-        print(
-            f"    [NAV-END] Waypoint ({target_grid_x},{target_grid_y}): arrived={reached}"
-        )
-        print(
-            f"      Internal: pos=({self.pose_x:.3f},{self.pose_y:.3f}) grid=({internal_grid_x},{internal_grid_y}) error={final_dist:.3f}m"
-        )
-        print(
-            f"      Actual:   pos=({actual['x_internal']:.3f},{actual['y_internal']:.3f}) grid=({actual_grid_x},{actual_grid_y}) error={actual_dist:.3f}m "
-            f"[world=({actual['x']:.3f},{actual['y']:.3f}), grid=({actual['grid_x_world']},{actual['grid_y_world']})]"
-        )
-
-        # WARN if internal and actual disagree on grid cell
-        if (internal_grid_x, internal_grid_y) != (actual_grid_x, actual_grid_y):
-            print(
-                f"      ⚠️  GRID MISMATCH! Internal thinks ({internal_grid_x},{internal_grid_y}) but actually at ({actual_grid_x},{actual_grid_y})"
-            )
-        if (internal_grid_x, internal_grid_y) != (target_grid_x, target_grid_y):
-            print(
-                f"      ⚠️  MISSED TARGET! Target was ({target_grid_x},{target_grid_y})"
-            )
 
         # Phase 3: Final heading correction (if specified)
         if target_heading is not None:

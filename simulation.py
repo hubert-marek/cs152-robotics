@@ -160,7 +160,7 @@ def _create_box(
     """Create pushable box. Returns (box_id, position)."""
     box_size = 0.20  # 20cm box for compact robot
     box_mass = 0.5  # Slightly heavier for more realistic physics
-    
+
     # Use provided position or default
     if box_pos_xy is not None:
         box_pos = [box_pos_xy[0], box_pos_xy[1], box_size / 2]
@@ -190,7 +190,7 @@ def _create_goal(goal_grid: tuple[int, int] | None = None) -> tuple[int, list[fl
         ]
     else:
         goal_pos = [1.25, 1.25, 0.01]
-    
+
     goal_vis = pybullet.createVisualShape(
         pybullet.GEOM_CYLINDER, radius=0.2, length=0.02, rgbaColor=[0, 1, 0, 0.5]
     )
@@ -250,7 +250,11 @@ def load_robot(start_grid_pos: tuple[int, int], start_orientation: int) -> int:
     # Driven wheels are joints 0 and 1 in this URDF.
     WHEEL_JOINTS = [0, 1]
 
-    # TODO, add comments on how we set up fricition so it is realisitc and what is a measurment unit in pybullet
+    # Friction setup for realistic wheeled locomotion.
+    # PyBullet's lateralFriction is the Coulomb friction coefficient (dimensionless).
+    # - Wheels (joints 0,1): High friction (5.0) for good traction without slip
+    # - Chassis/casters: Low friction (0.2) to allow smooth turning
+    # Reference: rubber on concrete ~0.6-0.8, but we use higher for stability.
     pybullet.changeDynamics(robot_id, -1, lateralFriction=0.2)
     for link in range(pybullet.getNumJoints(robot_id)):
         friction = 5.0 if link in WHEEL_JOINTS else 0.2
@@ -262,16 +266,17 @@ def load_robot(start_grid_pos: tuple[int, int], start_orientation: int) -> int:
 def step(n: int = 1, record_metrics: bool = True):
     """
     Step simulation forward n timesteps.
-    
+
     Each step advances physics by TIME_STEP (1/240 second).
     """
     for _ in range(n):
         pybullet.stepSimulation()
-    
+
     # Record simulation steps for metrics (if tracking is active)
     if record_metrics:
         try:
             from metrics import get_metrics
+
             get_metrics().record_sim_steps(n, TIME_STEP)
         except Exception:
             pass  # Metrics not available or not in a phase

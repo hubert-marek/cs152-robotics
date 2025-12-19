@@ -132,7 +132,7 @@ The simulation prints detailed logs including:
 ## Project Structure
 
 ```
-cs152-applied-ai-robotics/
+cs152-robotics/
 ├── main.py           # Entry point, test case definitions
 ├── simulation.py     # PyBullet environment setup
 ├── kb.py             # Knowledge base (robot beliefs)

@@ -40,7 +40,6 @@ class KnowledgeBase:
         self.goal: Optional[tuple[int, int]] = None
         self.box: Optional[tuple[int, int]] = None
 
-    # TODO I think we need to remove the set bounds function to be exactly alligned with room KB? Or it does not have influence on acutal robot only helps us in debugging purpuses?
     def set_bounds(self, min_x: int, max_x: int, min_y: int, max_y: int) -> None:
         """Set finite grid bounds for planning/mapping (inclusive)."""
         if min_x > max_x or min_y > max_y:
@@ -122,8 +121,9 @@ class KnowledgeBase:
     def set_box(self, x: int, y: int) -> None:
         """Set/overwrite the box cell."""
         if not self.in_bounds(x, y):
-            # Ignore obviously-invalid localization results instead of poisoning the KB.
-            # TODO - I Think this should not be here because we are doing SLAM? And we dont know the bounds fo the room?
+            # Safety check: ignore localization results far outside expected area.
+            # While true SLAM wouldn't have bounds, this prevents runaway drift from
+            # corrupting the KB with implausible positions.
             return
         self.box = (x, y)
         # The box is a dynamic object, not a static obstacle. So we do nOT encode it into the occupancy grid, otherwise the box leaves behind

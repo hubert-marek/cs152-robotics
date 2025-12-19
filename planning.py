@@ -78,17 +78,16 @@ def astar(
     """
     A* search on 4-connected grid with optional turn penalty.
 
-    Args:
-        kb: KnowledgeBase with occupancy info
-        start: (x, y) start cell
-        goal: (x, y) goal cell
-        start_heading: initial heading (NORTH/EAST/SOUTH/WEST), uses kb.robot_heading if None
-        allow_unknown: if True, treat UNKNOWN cells as traversable (optimistic)
-        turn_cost: penalty per 90° turn (0 = no penalty, 0.5 = half a cell cost per turn)
-        search_type: label for metrics ("navigation", "exploration", "sokoban")
-
-    Returns:
-        List of (x, y) cells from start to goal (inclusive), or None if no path.
+    Input:
+        -kb: KnowledgeBase with occupancy information
+        -start: (x, y) start cell
+        -goal: (x, y) goal cell
+        -start_heading: initial heading (NORTH/EAST/SOUTH/WEST)
+        -allow_unknown: if True, treat UNKNOWN cells as traversable
+        -turn_cost: penalty per 90 degree turn (0.5 = half cell cost)
+        -search_type: label for metrics ("navigation", "exploration", "sokoban")
+    Output:
+        -path: List of (x,y) cells from start to goal, or None if no path
     """
     search_start_time = time.perf_counter()
     nodes_expanded = 0
@@ -114,16 +113,10 @@ def astar(
         else:
             start_heading = EAST  # Default
 
-    # Check if goal is reachable in principle
+    # Check if goal is reachable - but allow navigating TO box cell
+    # because pushing requires moving into the box position
     if not kb.is_traversable(goal[0], goal[1], allow_unknown=allow_unknown):
-        # Goal might be the box cell during pushing - allow it
         if kb.box != goal:
-            # Debug: show why goal is not traversable
-            cell_state = kb.get_cell(goal[0], goal[1])
-            state_name = {-1: "UNKNOWN", 0: "FREE", 1: "OCC"}.get(cell_state, "???")
-            print(
-                f"    [DEBUG] A* goal {goal} not traversable: state={state_name}, box={kb.box}"
-            )
             # Record failed search
             search_time_ms = (time.perf_counter() - search_start_time) * 1000
             get_metrics().record_astar_search(
@@ -137,21 +130,28 @@ def astar(
             )
             return None
 
-    # State: (x, y, heading) to account for turn costs
-    # Priority queue: (f_score, g_score, (x, y, heading), path)
+    # State includes heading because turning has a cost for diff-drive robots
+    # This is different from standard grid A* which only tracks (x,y)
     initial_state = (start[0], start[1], start_heading)
+    
+    # Priority queue: (f_score, g_score, state, path)
+    # Using f as primary sort key for A* optimality
     open_set: list[
         tuple[float, float, tuple[int, int, int], list[tuple[int, int]]]
     ] = []
     heappush(open_set, (manhattan_distance(start, goal), 0.0, initial_state, [start]))
 
-    # visited tracks (x, y, heading) to allow revisiting with different headings if beneficial
+    # Track visited states (x,y,heading)
     visited: set[tuple[int, int, int]] = set()
 
+    # Main loop
     while open_set:
+        # Pop the state with the lowest f_score
         _, g, state, path = heappop(open_set)
         x, y, heading = state
 
+        # Goal check - we only care about position, not final heading
+        # Return the path if the goal is reached
         if (x, y) == goal:
             # Record successful search
             search_time_ms = (time.perf_counter() - search_start_time) * 1000
@@ -166,16 +166,17 @@ def astar(
             )
             return path
 
+        # Skip if the state has been visited
         if state in visited:
             continue
         visited.add(state)
         nodes_expanded += 1
 
-        # Explore 4-connected neighbors
+        # Expand 4-connected neighbors
         for neighbor in kb.neighbors4(x, y):
             nx, ny = neighbor
 
-            # Determine required heading to move to neighbor
+            # Calculate which direction we need to face to move there
             dx, dy = nx - x, ny - y
             required_heading = DELTA_TO_HEADING.get((dx, dy))
             if required_heading is None:
@@ -185,19 +186,21 @@ def astar(
             if neighbor_state in visited:
                 continue
 
-            # Check traversability
+            # Check if we can actually move there
             if not kb.is_traversable(nx, ny, allow_unknown=allow_unknown):
-                # Special case: allow moving TO the goal even if it's marked occupied
-                if neighbor != goal:
+                if neighbor != goal:  # Can move to goal even if occupied
                     continue
 
-            # Calculate cost: 1 for move + turn_cost * number of turns needed
+            # Cost calculation: 1 for the move itself, plus turn penalty
+            # turns_between returns 0, 1, or 2 (max 180 degrees = 2 turns)
             num_turns = turns_between(heading, required_heading)
             edge_cost = 1.0 + turn_cost * num_turns
 
             new_g = g + edge_cost
+            # Manhattan distance is admissible heuristic for 4-connected grid (used as f_score)
             new_f = new_g + manhattan_distance(neighbor, goal)
             new_path = path + [neighbor]
+            # Push the neighbor state with the new f_score
             heappush(open_set, (new_f, new_g, neighbor_state, new_path))
 
     # Record failed search
@@ -305,27 +308,19 @@ def plan_exploration_step(
         List of actions to execute, or None if no reachable frontier.
     """
     if kb.robot is None:
-        print("  [DEBUG] plan_exploration_step: robot is None")
         return None
 
     robot_pos = (kb.robot_x, kb.robot_y)
-    print(f"  [DEBUG] Robot at {robot_pos}, heading {kb.robot_heading}")
 
     # Try frontiers in increasing heuristic distance until we find a reachable one.
-    # This avoids prematurely giving up when the nearest frontier is blocked.
     frontiers = list(kb.frontiers())
-    print(f"  [DEBUG] Found {len(frontiers)} frontiers")
     if not frontiers:
-        print("  [DEBUG] No frontiers found!")
         return None
 
     frontiers.sort(key=lambda f: manhattan_distance(robot_pos, f))
-    print(f"  [DEBUG] Nearest 5 frontiers: {frontiers[:5]}")
 
-    attempted = 0
     for frontier in frontiers:
-        # We want to move TO a FREE cell adjacent to the frontier (not into UNKNOWN),
-        # so consider each FREE neighbor as an approach target.
+        # Move TO a FREE cell adjacent to the frontier (not into UNKNOWN)
         approaches = [
             (nx, ny) for (nx, ny) in kb.neighbors4(*frontier) if kb.is_free(nx, ny)
         ]
@@ -334,21 +329,12 @@ def plan_exploration_step(
         approaches.sort(key=lambda p: manhattan_distance(robot_pos, p))
 
         for approach in approaches:
-            attempted += 1
             path = astar(
                 kb, robot_pos, approach, turn_cost=turn_cost, search_type="exploration"
             )
-            if path is None:
-                print(
-                    f"  [DEBUG] No path to approach {approach} for frontier {frontier}"
-                )
-                continue
-            print(
-                f"  [DEBUG] Found path to {approach} (frontier {frontier}), length {len(path)}"
-            )
-            return path_to_actions(path, kb.robot_heading)
+            if path is not None:
+                return path_to_actions(path, kb.robot_heading)
 
-    print(f"  [DEBUG] Tried {attempted} approaches, none reachable")
     return None
 
 
@@ -364,18 +350,20 @@ def plan_box_delivery(
     max_states: int = 50000,
 ) -> Optional[list[str]]:
     """
-    Plan complete action sequence to deliver box to goal using A* over combined state.
+    Plan complete action sequence to deliver box to goal using A*.
 
-    This is Sokoban-style planning: searches over (robot_pos, robot_heading, box_pos)
-    to find the optimal sequence of turns and moves (including pushes).
+    This is Sokoban-style planning: we search over combined robot+box state
+    to find optimal sequence of moves. The key insight is that pushing is
+    just a special case of moving forward - when you move into the box cell,
+    both the robot and the box move in that direction.
 
-    Args:
-        kb: KnowledgeBase with robot/box/goal positions and occupancy
-        turn_cost: penalty per 90° turn (default 0.5)
-        max_states: maximum states to explore before giving up (prevents infinite loops)
-
-    Returns:
-        List of actions ['turn_left', 'turn_right', 'move_forward'], or None if no solution.
+    Input:
+        -kb: KnowledgeBase with robot/box/goal positions
+        -turn_cost: penalty per 90 degree turn (0.5 = half cell cost)
+        -max_states: search budget to prevent infinite loops
+    Output:
+        -actions: List of ['turn_left', 'turn_right', 'move_forward'],
+                  or None if no solution
     """
     search_start_time = time.perf_counter()
 
@@ -386,8 +374,7 @@ def plan_box_delivery(
     start_box = kb.box
     start_pos = (kb.robot_x, kb.robot_y)
 
-    # If already at goal, nothing to do
-    if start_box == goal_pos:
+    if start_box == goal_pos:  # Already done
         search_time_ms = (time.perf_counter() - search_start_time) * 1000
         get_metrics().record_astar_search(
             nodes_expanded=0,
@@ -400,11 +387,16 @@ def plan_box_delivery(
         )
         return []
 
-    # State: (robot_x, robot_y, robot_heading, box_x, box_y)
+    # 5D state: robot position + heading + box position
+    # This captures everything needed to determine valid moves
     start_state = (kb.robot_x, kb.robot_y, kb.robot_heading, start_box[0], start_box[1])
 
     def heuristic(state: tuple[int, int, int, int, int]) -> float:
-        """Heuristic: Manhattan distance from box to goal."""
+        """
+        Manhattan distance from box to goal.
+        This is admissible because box must move at least this many cells.
+        """
+        # Manhattan distance from box to goal
         _, _, _, bx, by = state
         return manhattan_distance((bx, by), goal_pos)
 
@@ -422,15 +414,12 @@ def plan_box_delivery(
 
     def is_cell_free(x: int, y: int, box_pos: tuple[int, int]) -> bool:
         """
-        Check if robot can occupy the cell, given a dynamic box position.
-
-        During delivery replanning we allow the *robot* to traverse UNKNOWN cells
-        (optimistic), otherwise the planner can easily return None on partially
-        explored maps. We still forbid pushing the box into UNKNOWN by requiring
-        the box destination cell be FREE (see push check below).
+        I use optimistic planning - UNKNOWN cells are allowed for robot
+        movement. This prevents the planner from getting stuck on partially
+        explored maps. If we hit an obstacle, we just replan.
         """
         if (x, y) == box_pos:
-            return False  # Can't walk through the box (unless pushing)
+            return False  # Can't walk through the box
         state = static_cell_state(x, y)
         return state == FREE or state == UNKNOWN
 
@@ -440,19 +429,23 @@ def plan_box_delivery(
         state = kb.get_cell(x, y)
         return state != OCC
 
-    # Priority queue: (f_score, g_score, state, actions)
     open_set: list[tuple[float, float, tuple[int, int, int, int, int], list[str]]] = []
+    # Push the start state with the heuristic value
     heappush(open_set, (heuristic(start_state), 0.0, start_state, []))
-
+    # Track visited states
     visited: set[tuple[int, int, int, int, int]] = set()
+    # Track number of states explored
     states_explored = 0
 
+    # Main loop
     while open_set and states_explored < max_states:
+        # Pop the state with the lowest f_score
         _, g, state, actions = heappop(open_set)
+        # Unpack the state
         rx, ry, heading, bx, by = state
         states_explored += 1
 
-        # Goal check: box at goal
+        # Goal - box at goal position (robot position doesn't matter)
         if (bx, by) == goal_pos:
             # Record successful search
             search_time_ms = (time.perf_counter() - search_start_time) * 1000

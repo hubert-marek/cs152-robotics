@@ -48,8 +48,5 @@ metrics_*.json
 # uv
 .python-version
 
-# PyBullet reference code (course materials, not part of submission)
-PybulletRobotics/
-
 # Misc
 other/

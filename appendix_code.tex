@@ -1,0 +1,690 @@
+\appendix
+
+\section{Core Algorithms}
+
+This appendix presents the key algorithms implementing the AI components described in the Solution Specification. The full code is available in the repository and zip files.
+
+\subsection{A* Navigation with Turn Penalties}
+
+The navigation A* operates over state $(x, y, \theta)$ to account for the differential-drive robot's turning cost. I chose to include heading in the state because a robot at the same position but facing different directions has different costs to reach neighbors - turning takes time.
+
+\begin{lstlisting}
+def astar(kb, start, goal, start_heading=None, allow_unknown=False, 
+          turn_cost=0.0):
+    """
+    A* search on 4-connected grid with optional turn penalty.
+    
+    Input:
+        -kb: KnowledgeBase with occupancy information
+        -start: (x, y) start cell
+        -goal: (x, y) goal cell  
+        -start_heading: initial heading (NORTH/EAST/SOUTH/WEST)
+        -allow_unknown: if True, treat UNKNOWN cells as traversable
+        -turn_cost: penalty per 90 degree turn (0.5 = half cell cost)
+    Output:
+        -path: List of (x,y) cells from start to goal, or None if no path
+    """
+    if start == goal:
+        return [start]
+    
+    if start_heading is None:
+        start_heading = kb.robot_heading if kb.robot else EAST
+    
+    # Check if goal is reachable - but allow navigating TO box cell 
+    # because pushing requires moving into the box position
+    if not kb.is_traversable(goal[0], goal[1], allow_unknown=allow_unknown):
+        if kb.box != goal:
+            return None
+    
+    # State includes heading because turning has a cost for diff-drive robots
+    # This is different from standard grid A* which only tracks (x,y)
+    initial_state = (start[0], start[1], start_heading)
+    
+    # Priority queue: (f_score, g_score, state, path)
+    # Using f as primary sort key for A* optimality
+    open_set = []
+    heappush(open_set, (manhattan_distance(start, goal), 0.0, 
+                        initial_state, [start]))
+    
+    # Track visited states (x,y,heading) 
+    visited = set()
+    
+    # Main loop
+    while open_set:
+        # Pop the state with the lowest f_score
+        _, g, state, path = heappop(open_set)
+        x, y, heading = state
+        
+        # Goal check - we only care about position, not final heading
+        # Return the path if the goal is reached
+        if (x, y) == goal:
+            return path
+        
+        # Skip if the state has been visited
+        if state in visited:
+            continue
+        visited.add(state)
+        
+        # Expand 4-connected neighbors
+        for nx, ny in kb.neighbors4(x, y):
+            # Calculate which direction we need to face to move there
+            dx, dy = nx - x, ny - y
+            required_heading = DELTA_TO_HEADING.get((dx, dy))
+            if required_heading is None:
+                continue
+            
+            neighbor_state = (nx, ny, required_heading)
+            if neighbor_state in visited:
+                continue
+            
+            # Check if we can actually move there
+            if not kb.is_traversable(nx, ny, allow_unknown=allow_unknown):
+                if (nx, ny) != goal:  # Can move to goal even if occupied
+                    continue
+            
+            # Cost calculation: 1 for the move itself, plus turn penalty
+            # turns_between returns 0, 1, or 2 (max 180 degrees = 2 turns)
+            num_turns = turns_between(heading, required_heading)
+            edge_cost = 1.0 + turn_cost * num_turns
+            
+            new_g = g + edge_cost
+            # Manhattan distance is admissible heuristic for 4-connected grid (used as f_score)
+            new_f = new_g + manhattan_distance((nx, ny), goal)
+            # Push the neighbor state with the new f_score
+            heappush(open_set, (new_f, new_g, neighbor_state, path + [(nx, ny)]))
+    
+    return None  # Exhausted search space without finding path
+\end{lstlisting}
+
+\subsection{Sokoban-Style Box Delivery Planning}
+
+This is the most interesting algorithm in the project. Unlike normal pathfinding, I need to plan robot and box positions together. The state space is 5-dimensional: $(r_x, r_y, \theta, b_x, b_y)$. A ``push'' is implicit - when the robot moves into the box cell, both robot and box advance.
+
+\begin{lstlisting}
+def plan_box_delivery(kb, turn_cost=0.5, max_states=50000):
+    """
+    Plan complete action sequence to deliver box to goal using A*.
+    
+    This is Sokoban-style planning: we search over combined robot+box state
+    to find optimal sequence of moves. The key insight is that pushing is
+    just a special case of moving forward - when you move into the box cell,
+    both the robot and the box move in that direction.
+    
+    Input:
+        -kb: KnowledgeBase with robot/box/goal positions
+        -turn_cost: penalty per 90 degree turn (0.5 = half cell cost)
+        -max_states: search budget to prevent infinite loops
+    Output:
+        -actions: List of ['turn_left', 'turn_right', 'move_forward'], 
+                  or None if no solution
+    """
+    if kb.robot is None or kb.box is None or kb.goal is None:
+        return None
+    
+    goal_pos = kb.goal
+    start_box = kb.box
+    
+    if start_box == goal_pos:
+        return []  # Already done
+    
+    # 5D state: robot position + heading + box position
+    # This captures everything needed to determine valid moves
+    start_state = (kb.robot_x, kb.robot_y, kb.robot_heading, 
+                   start_box[0], start_box[1])
+    
+    def heuristic(state):
+        """
+        Manhattan distance from box to goal.
+        This is admissible because box must move at least this many cells.
+        """
+
+        # Manhattan distance from box to goal
+        _, _, _, bx, by = state
+        return abs(bx - goal_pos[0]) + abs(by - goal_pos[1])
+    
+    def is_cell_free(x, y, box_pos):
+        """
+        I use optimistic planning - UNKNOWN cells are allowed for robot
+        movement. This prevents the planner from getting stuck on partially
+        explored maps. If we hit an obstacle, we just replan.
+        """
+        if (x, y) == box_pos:
+            return False  # Can't walk through the box
+        state = kb.get_cell(x, y)
+        return state == FREE or state == UNKNOWN
+    
+    open_set = []
+
+    # Push the start state with the heuristic value
+    heappush(open_set, (heuristic(start_state), 0.0, start_state, []))
+    # Track visited states
+    visited = set()
+    # Track number of states explored
+    states_explored = 0
+    
+    # Main loop
+    while open_set and states_explored < max_states:
+        # Pop the state with the lowest f_score
+        _, g, state, actions = heappop(open_set)
+        # Unpack the state
+        rx, ry, heading, bx, by = state
+        states_explored += 1
+        
+        # Goal - box at goal position (robot position doesn't matter)
+        if (bx, by) == goal_pos:
+            return actions
+        
+        # Skip if the state has been visited
+        if state in visited:
+            continue
+        visited.add(state)
+        
+        # Three possible actions: turn_left, turn_right, move_forward
+        
+        # Action 1: turn_left (heading decreases mod 4)
+        new_heading = (heading - 1) % 4
+        new_state = (rx, ry, new_heading, bx, by)
+        if new_state not in visited:
+            new_g = g + turn_cost
+            heappush(open_set, (new_g + heuristic(new_state), new_g, 
+                               new_state, actions + ["turn_left"]))
+        
+        # Action 2: turn_right (heading increases mod 4)
+        new_heading = (heading + 1) % 4
+        new_state = (rx, ry, new_heading, bx, by)
+        if new_state not in visited:
+            new_g = g + turn_cost
+            heappush(open_set, (new_g + heuristic(new_state), new_g, 
+                               new_state, actions + ["turn_right"]))
+        
+        # Action 3: move_forward - this is where it gets interesting
+        dx, dy = HEADING_TO_DELTA[heading]
+        ahead_x, ahead_y = rx + dx, ry + dy
+        
+        # Case A: Moving into empty cell (normal navigation)
+        if (ahead_x, ahead_y) != (bx, by):
+            if is_cell_free(ahead_x, ahead_y, (bx, by)):
+                new_state = (ahead_x, ahead_y, heading, bx, by)
+                if new_state not in visited:
+                    new_g = g + 1.0
+                    heappush(open_set, (new_g + heuristic(new_state), new_g, 
+                                       new_state, actions + ["move_forward"]))
+        
+        # Case B: Moving into box cell = PUSH
+        # Robot takes box's position, box moves one cell further
+        elif (ahead_x, ahead_y) == (bx, by):
+            box_dest_x, box_dest_y = bx + dx, by + dy
+            
+            # Box destination must not be a wall
+            # I allow pushing into UNKNOWN - optimistic planning
+            # If there's actually an obstacle, we'll discover it and replan
+            if kb.get_cell(box_dest_x, box_dest_y) != OCC:
+                new_state = (ahead_x, ahead_y, heading, box_dest_x, box_dest_y)
+                if new_state not in visited:
+                    new_g = g + 1.0  # Push costs same as move
+                    heappush(open_set, (new_g + heuristic(new_state), new_g, 
+                                       new_state, actions + ["move_forward"]))
+    
+    return None  # Exceeded state limit or no solution exists
+\end{lstlisting}
+
+\subsection{Knowledge Base Representation}
+
+The KB uses a sparse occupancy grid. The key design decision is storing the box separa from the occupancy grid. If I marked box cells as OCC, then when the box moves, I'd leave ``ghost obstacles'' behind. By tracking box position separately, the old cell correctly becomes FREE after a push.
+
+\begin{lstlisting}
+# Cell states - using integers for fast comparison
+UNKNOWN, FREE, OCC = -1, 0, 1
+
+# Headings - I chose 0,1,2,3 so modular arithmetic works for turning
+# (heading + 1) % 4 = turn right, (heading - 1) % 4 = turn left
+NORTH, EAST, SOUTH, WEST = 0, 1, 2, 3
+
+@dataclass(slots=True)
+class Pose:
+    """Discrete pose on the grid."""
+    x: int
+    y: int
+    heading: int  # NORTH/EAST/SOUTH/WEST
+
+class KnowledgeBase:
+    """
+    Sparse grid Knowledge Base with separate robot/box/goal tracking.
+    
+    Core idea: occ[(x,y)] stores ONLY static obstacle info (walls).
+    Dynamic objects (robot, box, goal) are stored as separate fields.
+    This prevents the "ghost obstacle" problem where moving objects
+    leave behind occupied cells.
+    """
+    
+    def __init__(self):
+        # defaultdict returns UNKNOWN for any cell we haven't seen
+        self.occ = defaultdict(lambda: UNKNOWN)
+        self.visited = set()  # Cells the robot has physically been in
+        self.robot: Optional[Pose] = None
+        self.goal: Optional[tuple[int, int]] = None
+        self.box: Optional[tuple[int, int]] = None  # NOT in occ grid
+    
+    def is_traversable(self, x, y, allow_unknown=False):
+        """
+        Can the robot move to this cell?
+        
+        Traversable means: FREE (or UNKNOWN if optimistic) AND not the box.
+        The box check is separate because box isn't in occ grid.
+        """
+        if not self.in_bounds(x, y):
+            return False
+        # Box blocks traversal even though it's not marked OCC
+        if self.box is not None and (x, y) == self.box:
+            return False
+        state = self.get_cell(x, y)
+        return state == FREE or (allow_unknown and state == UNKNOWN)
+    
+    def frontiers(self):
+        """
+        Return frontier cells: UNKNOWN cells adjacent to FREE cells.
+        
+        These are the "edges" of explored space - where we should
+        explore next to discover more of the environment.
+        """
+        # Initialize the frontier set
+        fr = set()
+        # Iterate over all the cells in the occupancy grid
+        for (x, y), state in self.occ.items():
+            # If the cell is not FREE, skip it
+            if state != FREE:
+                continue
+            # Iterate over all the neighbors of the cell
+            for nx, ny in self.neighbors4(x, y):
+                # If the neighbor is UNKNOWN, add it to the frontier
+                if self.is_unknown(nx, ny):
+                    fr.add((nx, ny))
+        return fr
+    
+    def move_box(self, new_x, new_y):
+        """
+        Update box position after a push.
+        
+        Mark old position as FREE so robot can pass through.
+        """
+        if self.box is not None:
+            self.mark_free(*self.box)  # Old position now traversable
+        self.box = (new_x, new_y)
+        # Box cell marked FREE in occ grid - box blocking is handled
+        # separately in is_traversable()
+        self.mark_free(new_x, new_y)
+\end{lstlisting}
+
+\subsection{LiDAR Integration with Bresenham Ray Tracing}
+
+Each LiDAR ray updates the occupancy grid using Bresenham's line algorithm. I.e. cells along the ray must be FREE (we can see through them), and the endpoint is either OCC (if we hit something) or FREE (if ray reached max range).
+
+\begin{lstlisting}
+def bresenham_cells(x0, y0, x1, y1):
+    """
+    Grid traversal from (x0,y0) to (x1,y1), inclusive endpoints.
+    
+    # https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
+    This is the Bresenham line algorithm adapted for grid cells.
+    I use it to find all cells a LiDAR ray passes through.
+    
+    Input:
+        -x0, y0: start cell (robot position)
+        -x1, y1: end cell (ray hit point)
+    Output:
+        -cells: list of (x,y) tuples along the line
+    """
+    cells = []
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1  # Step direction for x
+    sy = 1 if y0 < y1 else -1  # Step direction for y
+    err = dx - dy  # Error accumulator for diagonal stepping
+    x, y = x0, y0
+    
+    while True:
+        cells.append((x, y))
+        # Break if the current cell is the endpoint
+        if x == x1 and y == y1:
+            break
+        # Decision - which direction to step?
+        e2 = 2 * err
+        # Step in the y direction
+        if e2 > -dy:
+            # Update the error
+            err -= dy
+            # Step in the x direction
+            x += sx
+        # Step in the y direction
+        if e2 < dx:
+            # Update the error
+            err += dx
+            y += sy
+    return cells
+
+def integrate_lidar(kb, scan_data, cell_size, max_range, is_obstacle=None):
+    """
+    Update KB occupancy grid from LiDAR scan data.
+    
+    For each ray:
+    1. Trace cells from robot to hit point using Bresenham
+    2. Mark all intermediate cells as FREE (we can see through them)
+    3. Mark endpoint based on what we hit
+    
+    Input:
+        -kb: KnowledgeBase to update
+        -scan_data: list of (angle, distance, object_id) from LiDAR
+        -cell_size: meters per grid cell
+        -max_range: LiDAR maximum range in meters
+        -is_obstacle: optional function to filter what counts as obstacle
+    """
+    rx, ry = kb.robot.x, kb.robot.y
+    heading_yaw = ORIENTATION_ANGLES[kb.robot.heading]
+    
+    for ang, dist_m, obj_id in scan_data:
+        # Convert ray from robot-relative angle to world coordinates
+        world_ang = heading_yaw + ang
+        dx_m = cos(world_ang) * dist_m
+        dy_m = sin(world_ang) * dist_m
+        
+        # Convert from meters to grid cells
+        tx = rx + int(round(dx_m / cell_size))
+        ty = ry + int(round(dy_m / cell_size))
+        
+        # Get all cells along the ray
+        cells = bresenham_cells(rx, ry, tx, ty)
+        if not cells:
+            continue
+        
+        # This check is to determine if we actually hit something, or just reach max range
+        hit = obj_id != -1 and dist_m < max_range * 0.999
+        # If the object is an obstacle, treat it as an obstacle
+        treat_as_obstacle = hit and (is_obstacle(obj_id) if is_obstacle else True)
+        
+        # All cells except the endpoint are FREE as the ray passed through them
+        for cx, cy in cells[:-1]:
+
+            kb.mark_free(cx, cy)
+        
+        # Endpoint handling depends on what happened
+        ex, ey = cells[-1]
+        if treat_as_obstacle:
+            kb.mark_occupied(ex, ey)  # Hit a wall
+        elif not hit:
+            kb.mark_free(ex, ey)  # Ray reached max range, nothing there
+        # If hit non-obstacle (like box), leave endpoint unchanged
+\end{lstlisting}
+
+\subsection{LiDAR-Based Pose Recalibration}
+
+Dead reckoning accumulates drift, but We can use known wall positions to correct it. In an axis-aligned environment, even a signle wall provides enough constraint for yaw correction. If yaw estimate is wrong, different rays hitting the same wall will compute different ``implied'' wall positions. The correct yaw makes all rays agree.
+
+\begin{lstlisting}
+def _recalibrate_from_lidar(self, scan_data):
+    """
+    Correct accumulated pose drift using wall landmarks.
+    
+    Algorithm:
+    1. For each ray hitting a known wall, compute where that wall
+       should be based on current pose estimate
+    2. Compare to known wall position -> this gives us error
+    3. Correct position using median of errors (robust to outliers)
+    4. Correct yaw by finding angle that minimizes disagreement
+       between rays about where walls are
+    """
+    if not scan_data or not self._wall_landmarks or not self.wall_ids:
+        return
+    
+    x_errors, y_errors = [], []
+    
+    for ray_angle, d_measured, obj_id in scan_data:
+        # Only process confirmed wall hits
+        if obj_id not in self.wall_ids or obj_id == -1:
+            continue
+        if d_measured <= 0.05 or d_measured > self.lidar.max_range:
+            continue  # Filter out noise and max-range non-hits
+        
+        # Calculate absolute angle of this ray in world frame
+        a = normalize_angle(self.pose_yaw + ray_angle)
+        ca, sa = math.cos(a), math.sin(a)
+        
+        # Which wall did we hit? (east/west/north/south)
+        wall_type = self._wall_id_to_type.get(int(obj_id))
+        if wall_type is None:
+            continue
+        
+        key = f"wall_{wall_type}"
+        if key not in self._wall_landmarks:
+            continue
+        wall_pos = self._wall_landmarks[key]  # Known wall position
+        
+        # Compute residual: where ray implies wall is vs where it is
+        # For east/west walls (vertical), we care about X coordinate
+        # For north/south walls (horizontal), we care about Y coordinate
+        if wall_type in ("east", "west"):
+            if abs(ca) < 0.2:  # Ray nearly parallel to wall - skip
+                continue      # (grazing rays are noisy)
+            # Compute the implied x coordinate
+            implied_x = self.pose_x + d_measured * ca
+            # Compute the residual
+            residual = implied_x - wall_pos
+            # If the residual is less than the cell size, add it to the list of errors
+            if abs(residual) < CELL_SIZE:  # Sanity check
+                x_errors.append(residual)
+        else:  # north or south
+            if abs(sa) < 0.2:
+                continue
+            # Compute the implied y coordinate
+            implied_y = self.pose_y + d_measured * sa
+            # Compute the residual
+            residual = implied_y - wall_pos
+            # If the residual is less than the cell size, add it to the list of errors
+            if abs(residual) < CELL_SIZE:
+                y_errors.append(residual)
+    
+    # Position correction using median (robust to outliers from
+    # corners, noise, or rays that hit the box instead of wall)
+    if x_errors:
+        median_x = sorted(x_errors)[len(x_errors) // 2]
+        if abs(median_x) > 0.01:  # Only correct errors > 1cm
+            self.pose_x -= median_x * 0.8  # Damped to prevent oscillation
+    
+    if y_errors:
+        median_y = sorted(y_errors)[len(y_errors) // 2]
+        if abs(median_y) > 0.01:
+            self.pose_y -= median_y * 0.8
+    
+    # Yaw correction - this is the clever part
+    self._correct_yaw_from_wall_variance(scan_data)
+
+def _yaw_cost(self, theta, scan_data):
+    """
+    Cost function for yaw optimization.
+    
+    If yaw is wrong, rays hitting the same wall will
+    disagree about where that wall is. The correct yaw minimizes
+    this disagreement (variance of implied wall positions).
+    
+    Input:
+        -theta: candidate yaw angle to evaluate
+        -scan_data: LiDAR scan
+    Output:
+        -cost: mean squared residual, or None if insufficient data
+    """
+    residuals_sq = []
+    
+    for ray_angle, d_measured, obj_id in scan_data:
+        if obj_id not in self.wall_ids:
+            continue
+        wall_type = self._wall_id_to_type.get(int(obj_id))
+        if wall_type is None:
+            continue
+        
+        wall_pos = self._wall_landmarks.get(f"wall_{wall_type}")
+        if wall_pos is None:
+            continue
+        
+        # Recompute implied wall position with candidate yaw
+        a = normalize_angle(theta + ray_angle)
+        ca, sa = math.cos(a), math.sin(a)
+        
+        if wall_type in ("east", "west") and abs(ca) > 0.2:
+            r = (self.pose_x + d_measured * ca) - wall_pos
+        elif wall_type in ("north", "south") and abs(sa) > 0.2:
+            r = (self.pose_y + d_measured * sa) - wall_pos
+        else:
+            continue
+        
+        if abs(r) < CELL_SIZE:
+            residuals_sq.append(r * r)
+    
+    # At least 8 samples for reliable estimate
+    if len(residuals_sq) < 8:
+        return None
+    
+    # Trimmed mean - ignore worst 30% as outliers
+    # This handles rays that hit corners or got mislabeled
+    residuals_sq.sort()
+    keep = max(5, int(len(residuals_sq) * 0.7))
+    return sum(residuals_sq[:keep]) / keep
+\end{lstlisting}
+
+\subsection{Contact-Based Box Pushing}
+
+I use the bump sensor to detect contact, then keep driving while tracking distance traveled. This is more robust than open-loop ``drive for X seconds'' because it handles friction variation.
+
+\begin{lstlisting}
+def _push_box_with_verification(self, target_x, target_y, heading,
+                                 expected_box_x, expected_box_y, realtime):
+    """
+    Push box using contact-based execution.
+    
+    Two-phase approach:
+    1. Drive toward box until bump sensor detects contact
+    2. Keep pushing while maintaining contact, tracking distance
+        
+    Input:
+        -target_x, target_y: where robot should end up (box's current cell)
+        -heading: direction we're pushing
+        -expected_box_x/y: where box should end up after push
+        -realtime: whether to add visualization delays
+    Output:
+        -success: True if push completed (robot traveled ~1 cell while pushing)
+    """
+    push_distance = CELL_SIZE  # How far to push (1 grid cell)
+    dx, dy = DIRECTION_VECTORS[heading]
+    target_angle = math.atan2(dy, dx)  # Target heading in radians
+    
+    # Phase 1: Approach until we hit the box
+    contact_made = False
+    # Main loop
+    for step in range(400):  # Timeout after ~1.6 seconds
+        # Update the pose
+        self.robot.update_pose(TIME_STEP)
+        
+        # Check bump sensor - are we touching the box?
+        # If so, set contact_made to True and break the loop
+        if self.robot.is_in_contact_with(self.box_id):
+            contact_made = True
+            break
+        
+        # Drive toward box with heading correction
+        # This keeps us pointed straight even if we drift slightly
+        yaw_error = normalize_angle(target_angle - self.robot.pose_yaw)
+        correction = max(-3.0, min(3.0, 4.0 * yaw_error))  # P-controller
+        self.robot._set_drive_wheels(10.0, correction, realtime)
+        simulation.step(1)
+    
+    if not contact_made:
+        self.robot._stop()
+        return False  # Couldn't reach box e.g. obstacle or wrong position)
+    
+    # Phase 2- Keep pushing while in contact
+    push_start_x = self.robot.pose_x
+    push_start_y = self.robot.pose_y
+    contact_lost_count = 0  # Allow brief contact loss (bouncing)
+    
+    for step in range(600):  # Timeout after ~2.5 seconds
+        self.robot.update_pose(TIME_STEP)
+        
+        # How far have we pushed?
+        distance_pushed = math.sqrt(
+            (self.robot.pose_x - push_start_x) ** 2 +
+            (self.robot.pose_y - push_start_y) ** 2
+        )
+        
+        # Track contact status
+        if not self.robot.is_in_contact_with(self.box_id):
+            contact_lost_count += 1
+            if contact_lost_count > 50:  # Lost contact for too long
+                break
+        else:
+            contact_lost_count = 0  # Reset counter
+        
+        # Done when we've pushed far enough
+        if distance_pushed >= push_distance:
+            break
+        
+        # Keep driving with heading correction
+        yaw_error = normalize_angle(target_angle - self.robot.pose_yaw)
+        correction = max(-3.0, min(3.0, 4.0 * yaw_error))
+        self.robot._set_drive_wheels(10.0, correction, realtime)
+        simulation.step(1)
+    
+    # Success if we pushed at least half a cell
+    # (some tolerance for physics imprecision)
+    return distance_pushed >= push_distance * 0.5
+\end{lstlisting}
+
+\subsection{Frontier-Based Exploration}
+
+Frontiers are the UNKNOWN cells adjacent to FREE cells - the boundary of what we know. 
+We pick the nearest frontier and plan a path to get close enough to scan it.
+
+\begin{lstlisting}
+def plan_exploration_step(kb, turn_cost=0.5):
+    """
+    Plan actions to reach nearest frontier cell.
+    
+    Frontier = UNKNOWN cell next to FREE cell (boundary of explored area).
+    We don't plan into the frontier as it is unknown, instead we plan to
+    an adjacent FREE cell where we can scan the frontier.
+    
+    Input:
+        -kb: KnowledgeBase with current exploration state
+        -turn_cost: penalty per 90 degree turn
+    Output:
+        -actions: list of actions to execute, or None if nowhere to explore
+    """
+    if kb.robot is None:
+        return None
+    
+    robot_pos = (kb.robot_x, kb.robot_y)
+    frontiers = list(kb.frontiers())
+    if not frontiers:
+        return None  # Fully explored
+    
+    # We apply greedy search - try closest frontiers first (by Manhattan distance)
+    # This is a heuristic approximation - true optimal would try all
+    frontiers.sort(key=lambda f: manhattan_distance(robot_pos, f))
+    
+    for frontier in frontiers:
+        # Find FREE cells adjacent to this frontier
+        # These are "approach points" where we can scan the frontier
+        approaches = [(nx, ny) for (nx, ny) in kb.neighbors4(*frontier) 
+                      if kb.is_free(nx, ny)]
+        if not approaches:
+            continue  # This frontier is surrounded by unknown/walls
+        
+        # Sort approaches by distance (try closest first)
+        approaches.sort(key=lambda p: manhattan_distance(robot_pos, p))
+        
+        for approach in approaches:
+            # Try to find path to this approach point
+            path = astar(kb, robot_pos, approach, turn_cost=turn_cost)
+            if path is not None:
+                # Found a reachable approach point
+                return path_to_actions(path, kb.robot_heading)
+    
+    return None  # No reachable frontiers
+\end{lstlisting}
+
